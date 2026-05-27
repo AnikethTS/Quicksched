@@ -19,7 +19,7 @@ Each CPU has its own interactive DSQ. When an interactive task wakes from I/O, i
 - `clang`, `gcc`, `bpftool`, `libbpf-dev`
 
 ```sh
-sudo apt install clang gcc libbpf-dev linux-tools-$(uname -r)
+sudo apt install clang gcc libbpf-dev libncurses-dev linux-tools-$(uname -r)
 ```
 
 ## Build
@@ -53,6 +53,7 @@ sudo ./scx_snap -i 3000 -b 15000 -n -1 --batch-cpuperf-pct 30
 -p  min sleep % for interactive     (default: 50)
     --batch-cpuperf-pct N           batch task CPU freq % (default: 50)
     --no-cpuperf                    disable freq scaling
+    --no-tui                        plain text output instead of TUI
 -s  stats interval in seconds       (default: 1, 0 to disable)
 -v  verbose libbpf output
 ```
