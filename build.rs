@@ -9,7 +9,14 @@ fn main() {
 
     let f = File::create(&vmlinux).expect("failed to create vmlinux.h");
     let status = Command::new("bpftool")
-        .args(["btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "c"])
+        .args([
+            "btf",
+            "dump",
+            "file",
+            "/sys/kernel/btf/vmlinux",
+            "format",
+            "c",
+        ])
         .stdout(f)
         .status()
         .expect("bpftool not found");
