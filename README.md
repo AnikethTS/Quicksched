@@ -1,56 +1,58 @@
 # scx_snap
 
-A latency-optimized Linux scheduler built on [sched_ext](https://github.com/sched-ext/scx). It keeps interactive tasks (UI, audio, input handling) feeling snappy by separating them from batch/background work.
+A latency-optimized Linux scheduler built on [sched_ext](https://github.com/sched-ext/scx). Keeps interactive tasks (UI, audio, input handling) feeling snappy by separating them from batch/background work.
 
 ## How it works
 
-Tasks are put into one of two dispatch queues — interactive or batch. The interactive queue is always drained first, and tasks in it get a shorter 5ms time slice. Batch tasks get 20ms.
+Tasks are classified into two tiers:
 
-A task is classified as interactive if:
-- its nice value is ≤ 0 (or whatever threshold you set), or
-- after a few wakeup cycles, it's spending more than 50% of its wall time sleeping — the classic fingerprint of I/O-bound, latency-sensitive work
+- **Interactive** — short 5ms slices, dispatched first, preempts batch tasks on wakeup
+- **Batch** — standard 20ms slices, runs when no interactive work is pending
 
-The sleep ratio is tracked with an EWMA so it adapts as workloads change. Kernel threads always go to batch.
+A task is interactive if its nice value is ≤ 0 (configurable), or after a few wakeup cycles it's spending more than 50% of its wall time sleeping — the fingerprint of I/O-bound, latency-sensitive work. The ratio is tracked with an EWMA so it adapts as workloads change. Kernel threads always go to batch.
 
-When an idle CPU is found during `select_cpu`, the task bypasses the enqueue path entirely and goes straight to that CPU's local DSQ — this shaves a bit of latency off the hot path.
+Each CPU has its own interactive DSQ. When an interactive task wakes from I/O, it kicks its target CPU immediately (`SCX_KICK_PREEMPT`) rather than waiting for the next scheduling tick. CPU frequency is also boosted to max for interactive tasks and throttled for batch work via `scx_bpf_cpuperf_set`.
 
 ## Requirements
 
 - Linux 6.12+ with `CONFIG_SCHED_CLASS_EXT=y`
-- Rust toolchain
-- `clang`, `libbpf-dev`, `bpftool` (`linux-tools-$(uname -r)`)
+- `clang`, `gcc`, `bpftool`, `libbpf-dev`
+
+```sh
+sudo apt install clang gcc libbpf-dev linux-tools-$(uname -r)
+```
 
 ## Build
 
 ```sh
-cargo build --release
+make
 ```
 
-The build script generates `vmlinux.h` from the running kernel's BTF and compiles the BPF program automatically.
+The Makefile generates `vmlinux.h` from the running kernel's BTF, compiles the BPF program, and produces the `scx_snap` binary.
 
 ## Run
 
-Needs root to load a BPF scheduler:
-
 ```sh
-sudo ./target/release/scx_snap
-```
-
-Tune the slices or classification threshold:
-
-```sh
-sudo ./target/release/scx_snap -i 3000 -b 15000 -n -1
+sudo ./scx_snap
 ```
 
 Press Ctrl-C to stop. The kernel reverts all tasks to CFS automatically on exit.
 
+Tune slices, nice threshold, or CPU frequency behavior:
+
+```sh
+sudo ./scx_snap -i 3000 -b 15000 -n -1 --batch-cpuperf-pct 30
+```
+
 ## Options
 
 ```
--i  interactive slice in µs     (default: 5000)
--b  batch slice in µs           (default: 20000)
--n  nice threshold               (default: 0, tasks with nice <= this are always interactive)
--p  minimum sleep % for interactive classification  (default: 50)
--s  stats interval in seconds   (default: 1, 0 to disable)
+-i  interactive slice in us         (default: 5000)
+-b  batch slice in us               (default: 20000)
+-n  nice threshold                  (default: 0)
+-p  min sleep % for interactive     (default: 50)
+    --batch-cpuperf-pct N           batch task CPU freq % (default: 50)
+    --no-cpuperf                    disable freq scaling
+-s  stats interval in seconds       (default: 1, 0 to disable)
 -v  verbose libbpf output
 ```
