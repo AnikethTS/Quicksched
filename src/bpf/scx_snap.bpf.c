@@ -57,35 +57,12 @@ static __always_inline u32 log2_u64(u64 v)
 {
     u32 r = 0;
 
-    if (v >= (1ULL << 32))
-    {
-        v >>= 32;
-        r += 32;
-    }
-    if (v >= (1ULL << 16))
-    {
-        v >>= 16;
-        r += 16;
-    }
-    if (v >= (1ULL << 8))
-    {
-        v >>= 8;
-        r += 8;
-    }
-    if (v >= (1ULL << 4))
-    {
-        v >>= 4;
-        r += 4;
-    }
-    if (v >= (1ULL << 2))
-    {
-        v >>= 2;
-        r += 2;
-    }
-    if (v >= (1ULL << 1))
-    {
-        r += 1;
-    }
+    if (v >= (1ULL << 32)) { v >>= 32; r += 32; }
+    if (v >= (1ULL << 16)) { v >>= 16; r += 16; }
+    if (v >= (1ULL << 8))  { v >>= 8;  r += 8;  }
+    if (v >= (1ULL << 4))  { v >>= 4;  r += 4;  }
+    if (v >= (1ULL << 2))  { v >>= 2;  r += 2;  }
+    if (v >= (1ULL << 1))  { r += 1; }
     return r;
 }
 
@@ -144,14 +121,21 @@ static __always_inline void record_latency(u64 enqueue_at)
     }
 }
 
+/*
+ * Kernel 6.12+ passes struct_ops callback arguments via a context array
+ * (R1 = ctx[]) rather than individual registers. BPF_PROG rewrites each
+ * function to load args from ctx[0], ctx[1], … fixing "R2 !read_ok".
+ * We return int; the kernel ignores the value for void-typed slots.
+ */
+
 SEC("struct_ops/scx_snap_runnable")
-void scx_snap_runnable(struct task_struct *p, u64 enq_flags)
+int BPF_PROG(scx_snap_runnable, struct task_struct *p, u64 enq_flags)
 {
     struct snap_task_ctx *tctx;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
-        return;
+        return 0;
 
     if ((enq_flags & SCX_ENQ_WAKEUP) && tctx->sleep_at > 0)
     {
@@ -162,10 +146,11 @@ void scx_snap_runnable(struct task_struct *p, u64 enq_flags)
         tctx->sleep_at = 0;
         tctx->enqueue_at = scx_bpf_now();
     }
+    return 0;
 }
 
 SEC("struct_ops/scx_snap_select_cpu")
-s32 scx_snap_select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+s32 BPF_PROG(scx_snap_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     struct snap_task_ctx *tctx;
     bool is_idle = false;
@@ -195,7 +180,7 @@ s32 scx_snap_select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 }
 
 SEC("struct_ops/scx_snap_enqueue")
-void scx_snap_enqueue(struct task_struct *p, u64 enq_flags)
+int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
 {
     struct snap_task_ctx *tctx;
     struct snap_stats *st;
@@ -209,7 +194,7 @@ void scx_snap_enqueue(struct task_struct *p, u64 enq_flags)
     if (!tctx)
     {
         scx_bpf_dsq_insert(p, SNAP_DSQ_BATCH, slice_batch_ns, enq_flags);
-        return;
+        return 0;
     }
 
     interactive = task_is_interactive(p, tctx);
@@ -244,25 +229,27 @@ void scx_snap_enqueue(struct task_struct *p, u64 enq_flags)
         else
             st->nr_batch++;
     }
+    return 0;
 }
 
 SEC("struct_ops/scx_snap_dispatch")
-void scx_snap_dispatch(s32 cpu, struct task_struct *prev)
+int BPF_PROG(scx_snap_dispatch, s32 cpu, struct task_struct *prev)
 {
     if (cpu >= 0 && cpu < SNAP_MAX_CPUS && scx_bpf_dsq_move_to_local((u64)cpu))
-        return;
+        return 0;
     scx_bpf_dsq_move_to_local(SNAP_DSQ_BATCH);
+    return 0;
 }
 
 SEC("struct_ops/scx_snap_running")
-void scx_snap_running(struct task_struct *p)
+int BPF_PROG(scx_snap_running, struct task_struct *p)
 {
     struct snap_task_ctx *tctx;
     s32 cpu;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
-        return;
+        return 0;
 
     tctx->run_at = scx_bpf_now();
 
@@ -279,15 +266,16 @@ void scx_snap_running(struct task_struct *p)
         record_latency(tctx->enqueue_at);
         tctx->enqueue_at = 0;
     }
+    return 0;
 }
 
 SEC("struct_ops/scx_snap_stopping")
-void scx_snap_stopping(struct task_struct *p, bool runnable)
+int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
 {
     struct snap_task_ctx *tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
 
     if (!tctx)
-        return;
+        return 0;
 
     if (tctx->run_at > 0)
     {
@@ -299,10 +287,11 @@ void scx_snap_stopping(struct task_struct *p, bool runnable)
 
     if (!runnable)
         tctx->sleep_at = scx_bpf_now();
+    return 0;
 }
 
 SEC("struct_ops/scx_snap_init_task")
-s32 scx_snap_init_task(struct task_struct *p, struct scx_init_task_args *args)
+s32 BPF_PROG(scx_snap_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
     struct snap_task_ctx *tctx;
 
@@ -321,7 +310,10 @@ s32 scx_snap_init_task(struct task_struct *p, struct scx_init_task_args *args)
 }
 
 SEC("struct_ops/scx_snap_exit_task")
-void scx_snap_exit_task(struct task_struct *p, struct scx_exit_task_args *args) {}
+int BPF_PROG(scx_snap_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+{
+    return 0;
+}
 
 SEC("struct_ops.s/scx_snap_init")
 s32 scx_snap_init(void)
@@ -343,7 +335,10 @@ s32 scx_snap_init(void)
 }
 
 SEC("struct_ops/scx_snap_exit")
-void scx_snap_exit(struct scx_exit_info *ei) {}
+int BPF_PROG(scx_snap_exit, struct scx_exit_info *ei)
+{
+    return 0;
+}
 
 SEC(".struct_ops")
 struct sched_ext_ops scx_snap_ops = {

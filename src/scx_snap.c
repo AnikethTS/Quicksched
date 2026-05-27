@@ -8,12 +8,15 @@
 #include <signal.h>
 #include <getopt.h>
 #include <errno.h>
+#include <time.h>
+#include <ncurses.h>
 #include <bpf/libbpf.h>
 #include "scx_snap.h"
 #include "scx_snap.skel.h"
 
 static volatile int stop;
 static int verbose;
+static int no_tui;
 
 static int libbpf_print_fn(enum libbpf_print_level level,
                            const char *fmt, va_list args)
@@ -41,6 +44,7 @@ static void usage(const char *prog)
         "  -p, --interactive-sleep-pct N  min sleep %% for interactive (default: 50)\n"
         "      --batch-cpuperf-pct N      batch CPU freq %%         (default: 50)\n"
         "      --no-cpuperf               disable CPU freq scaling\n"
+        "      --no-tui                   plain text output\n"
         "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
         "  -v, --verbose                  verbose libbpf output\n"
         "  -h, --help\n",
@@ -92,6 +96,186 @@ static uint64_t lat_percentile(uint64_t *buckets, int pct)
     return 1ULL << (SNAP_LAT_BUCKETS - 1);
 }
 
+#define CP_HEADER 1
+#define CP_IACTIVE 2
+#define CP_BATCH 3
+#define CP_IDLE 4
+#define CP_LAT 5
+#define CP_DIM 6
+
+static void tui_init(void)
+{
+    initscr();
+    cbreak();
+    noecho();
+    curs_set(0);
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    if (has_colors())
+    {
+        start_color();
+        use_default_colors();
+        init_pair(CP_HEADER, COLOR_CYAN, -1);
+        init_pair(CP_IACTIVE, COLOR_GREEN, -1);
+        init_pair(CP_BATCH, COLOR_YELLOW, -1);
+        init_pair(CP_IDLE, COLOR_BLUE, -1);
+        init_pair(CP_LAT, COLOR_MAGENTA, -1);
+        init_pair(CP_DIM, COLOR_WHITE, -1);
+    }
+}
+
+static void draw_bar(int y, int x, int w, uint64_t val, uint64_t max, int cp)
+{
+    int filled = (max > 0 && w > 0) ? (int)(val * w / max) : 0;
+    if (filled > w)
+        filled = w;
+    if (cp)
+        attron(COLOR_PAIR(cp));
+    for (int i = 0; i < filled; i++)
+        mvaddch(y, x + i, ACS_BLOCK);
+    if (cp)
+        attroff(COLOR_PAIR(cp));
+    for (int i = filled; i < w; i++)
+        mvaddch(y, x + i, ' ');
+}
+
+static const char *lat_labels[SNAP_LAT_BUCKETS] = {
+    "   <1us", "    1us", "    2us", "    4us", "    8us", "   16us",
+    "   32us", "   64us", "  128us", "  256us", "  512us", "    1ms",
+    "    2ms", "    4ms", "    8ms", "   16ms", "   32ms", "   64ms",
+    "  128ms", "  256ms",
+};
+
+static void tui_draw(
+    uint64_t interactive_slice_us, uint64_t batch_slice_us,
+    int32_t nice_max, uint32_t sleep_pct,
+    int cpuperf_off,
+    uint64_t d_int, uint64_t d_batch, uint64_t d_local,
+    uint64_t d_count, uint64_t avg_us, uint64_t p50, uint64_t p99,
+    uint64_t *d_buckets,
+    uint64_t uptime_s)
+{
+    int rows, cols;
+    char uts[32];
+    int row, bar_w, lat_w, avail, show, i;
+    uint64_t tot, max_b;
+
+    getmaxyx(stdscr, rows, cols);
+    erase();
+
+    if (rows < 12 || cols < 40)
+    {
+        mvprintw(0, 0, "terminal too small");
+        refresh();
+        return;
+    }
+
+    box(stdscr, 0, 0);
+
+    attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
+    mvprintw(0, 2, " scx_snap ");
+    attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
+
+    snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ",
+             (unsigned long long)(uptime_s / 3600),
+             (unsigned long long)((uptime_s % 3600) / 60),
+             (unsigned long long)(uptime_s % 60));
+    mvprintw(0, cols - (int)strlen(uts) - 1, "%s", uts);
+
+    row = 1;
+
+    attron(COLOR_PAIR(CP_DIM));
+    mvprintw(row++, 2,
+             "slices: interactive=%lluus  batch=%lluus  nice<=%d  sleep>=%u%%  cpuperf: %s",
+             (unsigned long long)interactive_slice_us,
+             (unsigned long long)batch_slice_us,
+             nice_max, sleep_pct,
+             cpuperf_off ? "off" : "on");
+    attroff(COLOR_PAIR(CP_DIM));
+
+    row++;
+
+    attron(A_BOLD);
+    mvprintw(row++, 2, "SCHEDULING");
+    attroff(A_BOLD);
+
+    tot = d_int + d_batch + d_local;
+    bar_w = cols - 34;
+    if (bar_w < 8)
+        bar_w = 8;
+
+    struct { const char *label; uint64_t val; int cp; } srows[] = {
+        { "  interactive", d_int,   CP_IACTIVE },
+        { "  batch      ", d_batch, CP_BATCH   },
+        { "  idle-fast  ", d_local, CP_IDLE    },
+    };
+    for (i = 0; i < 3 && row < rows - 1; i++)
+    {
+        uint64_t pct = tot > 0 ? srows[i].val * 100 / tot : 0;
+        attron(COLOR_PAIR(srows[i].cp));
+        mvprintw(row, 2, "%s", srows[i].label);
+        attroff(COLOR_PAIR(srows[i].cp));
+        draw_bar(row, 16, bar_w, srows[i].val, tot > 0 ? tot : 1, srows[i].cp);
+        mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%",
+                 (unsigned long long)srows[i].val, (unsigned long long)pct);
+        row++;
+    }
+
+    row++;
+
+    if (row >= rows - 1)
+    {
+        refresh();
+        return;
+    }
+
+    attron(A_BOLD);
+    mvprintw(row++, 2, "WAKEUP LATENCY");
+    attroff(A_BOLD);
+
+    if (row < rows - 1)
+    {
+        if (d_count > 0)
+        {
+            attron(COLOR_PAIR(CP_DIM));
+            mvprintw(row++, 4, "avg=%lluus  p50=%lluus  p99=%lluus  n=%llu",
+                     (unsigned long long)avg_us,
+                     (unsigned long long)p50,
+                     (unsigned long long)p99,
+                     (unsigned long long)d_count);
+            attroff(COLOR_PAIR(CP_DIM));
+        }
+        else
+        {
+            mvprintw(row++, 4, "no data yet");
+        }
+    }
+
+    max_b = 1;
+    for (i = 0; i < SNAP_LAT_BUCKETS; i++)
+        if (d_buckets[i] > max_b)
+            max_b = d_buckets[i];
+
+    lat_w = cols - 24;
+    if (lat_w < 8)
+        lat_w = 8;
+    avail = rows - row - 1;
+    show = SNAP_LAT_BUCKETS < avail ? SNAP_LAT_BUCKETS : avail;
+
+    for (int i = 0; i < show && row < rows - 1; i++)
+    {
+        attron(COLOR_PAIR(CP_DIM));
+        mvprintw(row, 4, "%s", lat_labels[i]);
+        attroff(COLOR_PAIR(CP_DIM));
+        draw_bar(row, 12, lat_w, d_buckets[i], max_b, CP_LAT);
+        if (d_buckets[i] > 0)
+            mvprintw(row, 12 + lat_w + 1, "%llu", (unsigned long long)d_buckets[i]);
+        row++;
+    }
+
+    refresh();
+}
+
 int main(int argc, char **argv)
 {
     uint64_t interactive_slice_us = 5000;
@@ -109,6 +293,7 @@ int main(int argc, char **argv)
         {"interactive-sleep-pct", required_argument, 0, 'p'},
         {"batch-cpuperf-pct", required_argument, 0, 1},
         {"no-cpuperf", no_argument, 0, 2},
+        {"no-tui", no_argument, 0, 3},
         {"stats-interval", required_argument, 0, 's'},
         {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
@@ -136,6 +321,9 @@ int main(int argc, char **argv)
             break;
         case 2:
             no_cpuperf = 1;
+            break;
+        case 3:
+            no_tui = 1;
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -192,17 +380,34 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("scx_snap started\n");
-    printf("  slices: interactive=%llus batch=%llus\n",
-           (unsigned long long)interactive_slice_us,
-           (unsigned long long)batch_slice_us);
-    printf("  interactive: nice <= %d or sleep >= %u%%\n",
-           nice_interactive_max, interactive_sleep_pct);
-    if (!no_cpuperf)
-        printf("  cpuperf: interactive=100%% batch=%u%%\n", batch_cpuperf_pct);
+    if (!no_tui)
+    {
+        tui_init();
+    }
+    else
+    {
+        printf("scx_snap started\n");
+        printf("  slices: interactive=%lluus batch=%lluus\n",
+               (unsigned long long)interactive_slice_us,
+               (unsigned long long)batch_slice_us);
+        printf("  interactive: nice <= %d or sleep >= %u%%\n",
+               nice_interactive_max, interactive_sleep_pct);
+        if (!no_cpuperf)
+            printf("  cpuperf: interactive=100%% batch=%u%%\n", batch_cpuperf_pct);
+    }
 
     struct snap_stats prev_stats = {};
     struct snap_latency prev_lat = {};
+    time_t start_time = time(NULL);
+
+    if (!no_tui)
+    {
+        uint64_t zero[SNAP_LAT_BUCKETS] = {};
+        tui_draw(interactive_slice_us, batch_slice_us,
+                 nice_interactive_max, interactive_sleep_pct,
+                 no_cpuperf,
+                 0, 0, 0, 0, 0, 0, 0, zero, 0);
+    }
 
     while (!stop)
     {
@@ -228,16 +433,6 @@ int main(int argc, char **argv)
         uint64_t d_local = cur_stats.nr_local >= prev_stats.nr_local
                                ? cur_stats.nr_local - prev_stats.nr_local
                                : 0;
-        uint64_t total = d_int + d_batch + d_local;
-
-        if (total > 0)
-        {
-            printf("interactive=%6llu  batch=%6llu  idle-fast=%6llu  (%llu%% interactive)\n",
-                   (unsigned long long)d_int,
-                   (unsigned long long)d_batch,
-                   (unsigned long long)d_local,
-                   (unsigned long long)(d_int * 100 / total));
-        }
 
         uint64_t d_count = cur_lat.count >= prev_lat.count
                                ? cur_lat.count - prev_lat.count
@@ -251,21 +446,43 @@ int main(int argc, char **argv)
                                ? cur_lat.buckets[i] - prev_lat.buckets[i]
                                : 0;
 
-        if (d_count > 0)
+        uint64_t avg_us = d_count > 0 ? d_total_ns / d_count / 1000 : 0;
+        uint64_t p50 = lat_percentile(d_buckets, 50);
+        uint64_t p99 = lat_percentile(d_buckets, 99);
+
+        if (!no_tui)
         {
-            uint64_t avg_us = d_total_ns / d_count / 1000;
-            uint64_t p50 = lat_percentile(d_buckets, 50);
-            uint64_t p99 = lat_percentile(d_buckets, 99);
-            printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",
-                   (unsigned long long)avg_us,
-                   (unsigned long long)p50,
-                   (unsigned long long)p99,
-                   (unsigned long long)d_count);
+            uint64_t uptime_s = (uint64_t)(time(NULL) - start_time);
+            tui_draw(interactive_slice_us, batch_slice_us,
+                     nice_interactive_max, interactive_sleep_pct,
+                     no_cpuperf,
+                     d_int, d_batch, d_local,
+                     d_count, avg_us, p50, p99, d_buckets,
+                     uptime_s);
+        }
+        else
+        {
+            uint64_t total = d_int + d_batch + d_local;
+            if (total > 0)
+                printf("interactive=%6llu  batch=%6llu  idle-fast=%6llu  (%llu%% interactive)\n",
+                       (unsigned long long)d_int,
+                       (unsigned long long)d_batch,
+                       (unsigned long long)d_local,
+                       (unsigned long long)(d_int * 100 / total));
+            if (d_count > 0)
+                printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",
+                       (unsigned long long)avg_us,
+                       (unsigned long long)p50,
+                       (unsigned long long)p99,
+                       (unsigned long long)d_count);
         }
 
         prev_stats = cur_stats;
         prev_lat = cur_lat;
     }
+
+    if (!no_tui)
+        endwin();
 
     printf("scx_snap exiting\n");
     scx_snap_bpf__destroy(skel);

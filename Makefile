@@ -2,6 +2,7 @@ CC        := gcc
 BPF_CC    := clang
 CFLAGS    := -O2 -g -Wall -Wextra
 BPF_FLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86 -fno-stack-protector
+LDFLAGS   := -L/usr/lib64 -Wl,-rpath,/usr/lib64
 
 BUILDDIR  := build
 VMLINUX   := $(BUILDDIR)/vmlinux.h
@@ -24,12 +25,9 @@ $(BPF_OBJ): src/bpf/scx_snap.bpf.c src/bpf/scx_snap.h $(VMLINUX) | $(BUILDDIR)
 
 $(SKEL_H): $(BPF_OBJ) | $(BUILDDIR)
 	bpftool gen skeleton $< > $@
-	# bpftool 7.7 generates code for libbpf 1.7 (map->link) but distro ships 1.3
-	# We attach struct_ops manually so drop the auto-link line
-	sed -i '/map->link = /d' $@
 
 $(TARGET): src/scx_snap.c src/bpf/scx_snap.h $(SKEL_H)
-	$(CC) $(CFLAGS) -I$(BUILDDIR) -Isrc/bpf $< -lbpf -o $@
+	$(CC) $(CFLAGS) -I$(BUILDDIR) -Isrc/bpf $< $(LDFLAGS) -lbpf -lncurses -o $@
 
 clean:
 	rm -rf $(BUILDDIR) $(TARGET)
