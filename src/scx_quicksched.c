@@ -17,6 +17,7 @@
 static volatile int stop;
 static int verbose;
 static int no_tui;
+static int dry_run;
 static uint64_t slo_us = 0;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *fmt, va_list args)
@@ -45,6 +46,7 @@ static void usage(const char *prog)
            "      --batch-cpuperf-pct N      batch CPU freq %%         (default: 50)\n"
            "      --no-cpuperf               disable CPU freq scaling\n"
            "      --no-tui                   plain text output\n"
+           "      --dry-run                  load and verify BPF; exit without attaching\n"
            "      --slo-us N                 alert when p99 latency exceeds N us (0=off)\n"
            "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
            "  -v, --verbose                  verbose libbpf output\n"
@@ -291,9 +293,19 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
         return;
     }
 
-    attron(A_BOLD);
-    mvprintw(row++, 2, "CPU LOAD  (dispatch/s)");
-    attroff(A_BOLD);
+    {
+        int active = 0;
+        for (int ci = 0; ci < ncpus; ci++)
+            if (d_cpu != NULL && d_cpu[ci] > 0)
+                active++;
+        attron(A_BOLD);
+        mvprintw(row, 2, "CPU LOAD  (dispatch/s)");
+        attroff(A_BOLD);
+        attron(COLOR_PAIR(CP_DIM));
+        mvprintw(row, 25, "  %d/%d active", active, ncpus);
+        attroff(COLOR_PAIR(CP_DIM));
+        row++;
+    }
 
     if (ncpus > 0 && d_cpu != NULL)
     {
@@ -316,9 +328,18 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
             attron(COLOR_PAIR(CP_DIM));
             mvprintw(row, x, "CPU%3d", ci);
             attroff(COLOR_PAIR(CP_DIM));
-            draw_bar(row, x + 6, cpu_bar_w, d_cpu[ci], cpu_max,
-                     pct > 75 ? CP_IACTIVE : (pct > 30 ? CP_BATCH : CP_IDLE));
-            mvprintw(row, x + 6 + cpu_bar_w + 1, "%5llu", (unsigned long long)d_cpu[ci]);
+            if (d_cpu[ci] == 0)
+            {
+                attron(COLOR_PAIR(CP_DIM));
+                mvprintw(row, x + 6, "%-*s  idle", cpu_bar_w, "");
+                attroff(COLOR_PAIR(CP_DIM));
+            }
+            else
+            {
+                draw_bar(row, x + 6, cpu_bar_w, d_cpu[ci], cpu_max,
+                         pct > 75 ? CP_IACTIVE : (pct > 30 ? CP_BATCH : CP_IDLE));
+                mvprintw(row, x + 6 + cpu_bar_w + 1, "%5llu", (unsigned long long)d_cpu[ci]);
+            }
             col_idx++;
             if (col_idx >= 2)
             {
@@ -405,6 +426,7 @@ int main(int argc, char **argv)
                                               {"no-cpuperf", no_argument, 0, 2},
                                               {"no-tui", no_argument, 0, 3},
                                               {"slo-us", required_argument, 0, 4},
+                                              {"dry-run", no_argument, 0, 5},
                                               {"stats-interval", required_argument, 0, 's'},
                                               {"verbose", no_argument, 0, 'v'},
                                               {"version", no_argument, 0, 'V'},
@@ -439,6 +461,9 @@ int main(int argc, char **argv)
             break;
         case 4:
             slo_us = strtoull(optarg, NULL, 10);
+            break;
+        case 5:
+            dry_run = 1;
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -490,6 +515,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to load BPF object: %s\n", errbuf);
         scx_quicksched_bpf__destroy(skel);
         return 1;
+    }
+
+    if (dry_run)
+    {
+        printf("dry-run: BPF object loaded OK — kernel is compatible with scx_quicksched\n");
+        printf("  sched_ext BTF verified, all programs JIT-compiled, maps created\n");
+        scx_quicksched_bpf__destroy(skel);
+        return 0;
     }
 
     skel->links.scx_quicksched_ops = bpf_map__attach_struct_ops(skel->maps.scx_quicksched_ops);

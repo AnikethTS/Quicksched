@@ -108,8 +108,11 @@ The unit restarts automatically on failure (`Restart=on-failure`). It will not s
     --batch-cpuperf-pct N       batch CPU freq %              (default: 50)
     --no-cpuperf                disable CPU freq scaling
     --no-tui                    plain text output
+    --dry-run                   load and verify BPF; exit without attaching
+    --slo-us N                  alert when p99 latency exceeds N µs (0=off)
 -s  --stats-interval N          stats interval in seconds     (default: 1, 0=off)
 -v  --verbose                   verbose libbpf output
+-V  --version                   print version and exit
 -h  --help
 ```
 
@@ -119,6 +122,7 @@ The ncurses TUI refreshes every stats interval and shows three sections:
 
 - **SCHEDULING** — per-second dispatch counts for interactive, batch, and idle-fast (local) queues with bar charts
 - **MEMORY** — per-second memalloc-demoted task count and early-stop (preempted/stalled) count
+- **CPU LOAD** — per-CPU dispatch rate bars; idle CPUs are labelled; header shows active/total CPU count
 - **WAKEUP LATENCY** — avg/p50/p99 wakeup latency and a log-scale histogram (bucket resolution doubles each step, from <1 µs to ~128 ms)
 
 ## Project structure
