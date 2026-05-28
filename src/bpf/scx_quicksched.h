@@ -26,44 +26,44 @@
 
 struct qs_task_ctx
 {
-	__u64 sum_run_ns;
-	__u64 sum_sleep_ns;
-	__u64 run_at;
-	__u64 sleep_at;
-	__u64 enqueue_at;
-	__u64 assigned_slice_ns;
-	__u64 slice_util_ewma; /* EWMA of slice utilisation % (0-100); 100 = CPU-bound */
-	__u32 wakeups;
-	__u8 pad[4];
+    __u64 sum_run_ns;
+    __u64 sum_sleep_ns;
+    __u64 run_at;
+    __u64 sleep_at;
+    __u64 enqueue_at;
+    __u64 assigned_slice_ns;
+    __u64 slice_util_ewma; /* EWMA of slice utilisation % (0-100); 100 = CPU-bound */
+    __u32 wakeups;
+    __u8 pad[4];
 };
 
 struct qs_stats
 {
-	__u64 nr_interactive;
-	__u64 nr_batch;
-	__u64 nr_local;
-	__u64 nr_preempted;  /* tasks that stopped before exhausting their slice */
-	__u64 nr_memalloc;   /* tasks demoted to batch due to PF_MEMALLOC */
-	__u64 nr_stolen;     /* tasks work-stolen from another CPU's interactive DSQ */
+    __u64 nr_interactive;
+    __u64 nr_batch;
+    __u64 nr_local;
+    __u64 nr_preempted; /* tasks that stopped before exhausting their slice */
+    __u64 nr_memalloc;  /* tasks demoted to batch due to PF_MEMALLOC */
+    __u64 nr_stolen;    /* tasks work-stolen from another CPU's interactive DSQ */
 };
 
 struct qs_latency
 {
-	__u64 buckets[QS_LAT_BUCKETS];
-	__u64 total_ns;
-	__u64 count;
+    __u64 buckets[QS_LAT_BUCKETS];
+    __u64 total_ns;
+    __u64 count;
 };
 
 /* Global batch queue depth — used for adaptive CPU frequency scaling. */
 struct qs_batch_depth
 {
-	__s64 depth;
+    __s64 depth;
 };
 
 /* Per-CPU dispatch counter — PERCPU_ARRAY, one entry per CPU. */
 struct qs_cpu_load
 {
-	__u64 nr_dispatch;
+    __u64 nr_dispatch;
 };
 
 #endif
