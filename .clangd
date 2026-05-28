@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -Ibuild
+    - -Isrc/bpf
+    - -I/usr/src/linux-headers-6.17.0-29-generic/tools/bpf/resolve_btfids/libbpf/include
+    - -D_GNU_SOURCE
+    - -D__x86_64__

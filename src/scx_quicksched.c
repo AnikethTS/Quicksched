@@ -47,6 +47,25 @@ static bool read_psi_memory(struct qs_psi *out)
     return true;
 }
 
+/* scx_exit_kind ranges (stable across kernel versions within a range) */
+#define SCX_EXIT_NONE 0
+#define SCX_EXIT_DONE 1
+#define SCX_EXIT_UNREG_BASE 64
+#define SCX_EXIT_ERROR_BASE 1024
+
+static const char *exit_kind_str(uint32_t kind)
+{
+    if (kind == SCX_EXIT_NONE)
+        return "none";
+    if (kind == SCX_EXIT_DONE)
+        return "done (normal)";
+    if (kind >= SCX_EXIT_ERROR_BASE)
+        return "error";
+    if (kind >= SCX_EXIT_UNREG_BASE)
+        return "unregistered by kernel";
+    return "unknown";
+}
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *fmt, va_list args)
 {
     if (level == LIBBPF_DEBUG && !verbose)
@@ -202,7 +221,8 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
                      uint64_t d_local, uint64_t d_preempted, uint64_t d_memalloc,
                      uint64_t d_mem_stall, uint64_t d_count, uint64_t avg_us, uint64_t p50,
                      uint64_t p99, uint64_t *d_buckets, uint64_t uptime_s, uint64_t slo_alert_us,
-                     const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu, int ncpus)
+                     const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu,
+                     uint64_t *d_cpu_interactive, int ncpus)
 {
     int rows, cols;
     char uts[32];
@@ -379,7 +399,9 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
             {
                 draw_bar(row, x + 6, cpu_bar_w, d_cpu[ci], cpu_max,
                          pct > 75 ? CP_IACTIVE : (pct > 30 ? CP_BATCH : CP_IDLE));
-                mvprintw(row, x + 6 + cpu_bar_w + 1, "%5llu", (unsigned long long)d_cpu[ci]);
+                uint64_t ipct = d_cpu[ci] > 0 ? (d_cpu_interactive[ci] * 100 / d_cpu[ci]) : 0;
+                mvprintw(row, x + 6 + cpu_bar_w + 1, "%5llu %3llu%%i",
+                         (unsigned long long)d_cpu[ci], (unsigned long long)ipct);
             }
             col_idx++;
             if (col_idx >= 2)
@@ -605,7 +627,8 @@ int main(int argc, char **argv)
     struct qs_cpu_load *prev_cpu_loads = calloc(ncpus, sizeof(*prev_cpu_loads));
     struct qs_cpu_load *cur_cpu_loads = calloc(ncpus, sizeof(*cur_cpu_loads));
     uint64_t *d_cpu = calloc(ncpus, sizeof(*d_cpu));
-    if (!prev_cpu_loads || !cur_cpu_loads || !d_cpu)
+    uint64_t *d_cpu_interactive = calloc(ncpus, sizeof(*d_cpu_interactive));
+    if (!prev_cpu_loads || !cur_cpu_loads || !d_cpu || !d_cpu_interactive)
     {
         fprintf(stderr, "error: out of memory\n");
         if (!no_tui)
@@ -613,6 +636,7 @@ int main(int argc, char **argv)
         free(prev_cpu_loads);
         free(cur_cpu_loads);
         free(d_cpu);
+        free(d_cpu_interactive);
         scx_quicksched_bpf__destroy(skel);
         return 1;
     }
@@ -625,7 +649,7 @@ int main(int argc, char **argv)
     {
         uint64_t zero[QS_LAT_BUCKETS] = {};
         tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max, interactive_sleep_pct,
-                 no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, 0);
+                 no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, NULL, 0);
     }
 
     while (!stop)
@@ -664,9 +688,15 @@ int main(int argc, char **argv)
         read_percpu(skel->maps.latency, &cur_lat, sizeof(cur_lat));
         read_percpu_array(skel->maps.cpu_load, cur_cpu_loads, sizeof(*cur_cpu_loads), ncpus);
         for (int i = 0; i < ncpus; i++)
+        {
             d_cpu[i] = cur_cpu_loads[i].nr_dispatch >= prev_cpu_loads[i].nr_dispatch
                            ? cur_cpu_loads[i].nr_dispatch - prev_cpu_loads[i].nr_dispatch
                            : 0;
+            d_cpu_interactive[i] =
+                cur_cpu_loads[i].nr_interactive >= prev_cpu_loads[i].nr_interactive
+                    ? cur_cpu_loads[i].nr_interactive - prev_cpu_loads[i].nr_interactive
+                    : 0;
+        }
 
         uint64_t d_int = cur_stats.nr_interactive >= prev_stats.nr_interactive
                              ? cur_stats.nr_interactive - prev_stats.nr_interactive
@@ -707,7 +737,7 @@ int main(int argc, char **argv)
             tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max,
                      interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
                      d_memalloc, d_mem_stall, d_count, avg_us, p50, p99, d_buckets, uptime_s,
-                     slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, ncpus);
+                     slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus);
         }
         else
         {
@@ -745,8 +775,28 @@ int main(int argc, char **argv)
     free(prev_cpu_loads);
     free(cur_cpu_loads);
     free(d_cpu);
+    free(d_cpu_interactive);
 
-    printf("scx_quicksched exiting\n");
+    /* Report scheduler exit reason if the BPF side filled it in. */
+    {
+        struct qs_exit_info xi = {};
+        uint32_t key = 0;
+        bpf_map__lookup_elem(skel->maps.exit_info, &key, sizeof(key), &xi, sizeof(xi), 0);
+        if (xi.kind != SCX_EXIT_NONE && xi.kind != SCX_EXIT_DONE)
+        {
+            fprintf(stderr, "scx_quicksched: scheduler exited unexpectedly\n");
+            fprintf(stderr, "  kind:   %s (%u)\n", exit_kind_str(xi.kind), xi.kind);
+            if (xi.reason[0])
+                fprintf(stderr, "  reason: %s\n", xi.reason);
+            if (xi.msg[0])
+                fprintf(stderr, "  msg:    %s\n", xi.msg);
+        }
+        else
+        {
+            printf("scx_quicksched: stopped (%s)\n", exit_kind_str(xi.kind));
+        }
+    }
+
     scx_quicksched_bpf__destroy(skel);
     return 0;
 }

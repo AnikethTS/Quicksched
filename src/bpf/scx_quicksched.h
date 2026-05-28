@@ -24,6 +24,9 @@
 /* Batch queue depth at which batch tasks ramp to full CPU frequency. */
 #define QS_CPUPERF_LOAD_FULL 16
 
+/* Max CPUs to work-steal from; stride-spaced to cover the whole machine. */
+#define QS_MAX_STEAL_CPUS 16
+
 struct qs_task_ctx
 {
     __u64 sum_run_ns;
@@ -74,6 +77,20 @@ struct qs_batch_depth
 struct qs_cpu_load
 {
     __u64 nr_dispatch;
+    __u64 nr_interactive;
+    __u64 nr_batch;
+};
+
+/* Exit information written by the BPF exit callback. */
+#define QS_EXIT_REASON_LEN 64
+#define QS_EXIT_MSG_LEN 128
+
+struct qs_exit_info
+{
+    __u32 kind; /* enum scx_exit_kind */
+    __u32 pad;
+    char reason[QS_EXIT_REASON_LEN];
+    char msg[QS_EXIT_MSG_LEN];
 };
 
 #endif
