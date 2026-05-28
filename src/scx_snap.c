@@ -36,7 +36,8 @@ static void usage(const char *prog)
 {
     printf(
         "Usage: %s [OPTIONS]\n\n"
-        "Latency-optimized sched_ext scheduler. Requires root.\n\n"
+        "Latency-optimized sched_ext scheduler. Requires root.\n"
+        "Developed by Aniketh T S\n\n"
         "Options:\n"
         "  -i, --interactive-slice-us N   interactive slice in us  (default: 5000)\n"
         "  -b, --batch-slice-us N         batch slice in us         (default: 20000)\n"
@@ -140,10 +141,26 @@ static void draw_bar(int y, int x, int w, uint64_t val, uint64_t max, int cp)
 }
 
 static const char *lat_labels[SNAP_LAT_BUCKETS] = {
-    "   <1us", "    1us", "    2us", "    4us", "    8us", "   16us",
-    "   32us", "   64us", "  128us", "  256us", "  512us", "    1ms",
-    "    2ms", "    4ms", "    8ms", "   16ms", "   32ms", "   64ms",
-    "  128ms", "  256ms",
+    "   <1us",
+    "    1us",
+    "    2us",
+    "    4us",
+    "    8us",
+    "   16us",
+    "   32us",
+    "   64us",
+    "  128us",
+    "  256us",
+    "  512us",
+    "    1ms",
+    "    2ms",
+    "    4ms",
+    "    8ms",
+    "   16ms",
+    "   32ms",
+    "   64ms",
+    "  128ms",
+    "  256ms",
 };
 
 static void tui_draw(
@@ -177,6 +194,10 @@ static void tui_draw(
     mvprintw(0, 2, " scx_snap ");
     attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
 
+    attron(COLOR_PAIR(CP_DIM));
+    mvprintw(0, 13, "by Aniketh T S");
+    attroff(COLOR_PAIR(CP_DIM));
+
     snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ",
              (unsigned long long)(uptime_s / 3600),
              (unsigned long long)((uptime_s % 3600) / 60),
@@ -205,10 +226,15 @@ static void tui_draw(
     if (bar_w < 8)
         bar_w = 8;
 
-    struct { const char *label; uint64_t val; int cp; } srows[] = {
-        { "  interactive", d_int,   CP_IACTIVE },
-        { "  batch      ", d_batch, CP_BATCH   },
-        { "  idle-fast  ", d_local, CP_IDLE    },
+    struct
+    {
+        const char *label;
+        uint64_t val;
+        int cp;
+    } srows[] = {
+        {"  interactive", d_int, CP_IACTIVE},
+        {"  batch      ", d_batch, CP_BATCH},
+        {"  idle-fast  ", d_local, CP_IDLE},
     };
     for (i = 0; i < 3 && row < rows - 1; i++)
     {
@@ -235,9 +261,14 @@ static void tui_draw(
     attroff(A_BOLD);
 
     {
-        struct { const char *label; uint64_t val; int cp; } mrows[] = {
-            { "  memalloc  ", d_memalloc,  CP_BATCH },
-            { "  preempted ", d_preempted, CP_LAT   },
+        struct
+        {
+            const char *label;
+            uint64_t val;
+            int cp;
+        } mrows[] = {
+            {"  memalloc  ", d_memalloc, CP_BATCH},
+            {"  preempted ", d_preempted, CP_LAT},
         };
         uint64_t mem_scale = tot > 0 ? tot : 1;
         for (i = 0; i < 2 && row < rows - 1; i++)
@@ -305,6 +336,10 @@ static void tui_draw(
             mvprintw(row, 12 + lat_w + 1, "%llu", (unsigned long long)d_buckets[i]);
         row++;
     }
+
+    attron(COLOR_PAIR(CP_DIM));
+    mvprintw(rows - 1, 2, " developed by Aniketh T S ");
+    attroff(COLOR_PAIR(CP_DIM));
 
     refresh();
 }
@@ -384,7 +419,9 @@ int main(int argc, char **argv)
     struct scx_snap_bpf *skel = scx_snap_bpf__open();
     if (!skel)
     {
-        fprintf(stderr, "failed to open BPF object: %s\n", strerror(errno));
+        char errbuf[256];
+        libbpf_strerror(-errno, errbuf, sizeof(errbuf));
+        fprintf(stderr, "failed to open BPF object: %s\n", errbuf);
         return 1;
     }
 
@@ -395,9 +432,12 @@ int main(int argc, char **argv)
     skel->rodata->enable_cpuperf = !no_cpuperf;
     skel->rodata->batch_cpuperf_abs = batch_cpuperf_pct * 1024 / 100;
 
-    if (scx_snap_bpf__load(skel))
+    int err = scx_snap_bpf__load(skel);
+    if (err)
     {
-        fprintf(stderr, "failed to load BPF object: %s\n", strerror(errno));
+        char errbuf[256];
+        libbpf_strerror(err, errbuf, sizeof(errbuf));
+        fprintf(stderr, "failed to load BPF object: %s\n", errbuf);
         scx_snap_bpf__destroy(skel);
         return 1;
     }
@@ -405,7 +445,9 @@ int main(int argc, char **argv)
     skel->links.scx_snap_ops = bpf_map__attach_struct_ops(skel->maps.scx_snap_ops);
     if (!skel->links.scx_snap_ops)
     {
-        fprintf(stderr, "failed to attach scheduler: %s\n", strerror(errno));
+        char errbuf[256];
+        libbpf_strerror(-errno, errbuf, sizeof(errbuf));
+        fprintf(stderr, "failed to attach scheduler: %s\n", errbuf);
         scx_snap_bpf__destroy(skel);
         return 1;
     }
@@ -419,7 +461,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        printf("scx_snap started\n");
+        printf("scx_snap — developed by Aniketh T S\n");
         printf("  slices: interactive=%lluus batch=%lluus\n",
                (unsigned long long)interactive_slice_us,
                (unsigned long long)batch_slice_us);
