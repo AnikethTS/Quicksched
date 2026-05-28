@@ -50,6 +50,14 @@ struct
     __type(value, struct qs_cpu_load);
 } cpu_load SEC(".maps");
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qs_dynamic_cfg);
+} dynamic_cfg SEC(".maps");
+
 const volatile __u64 slice_interactive_ns = QS_SLICE_INTERACTIVE_NS;
 const volatile __u64 slice_batch_ns = QS_SLICE_BATCH_NS;
 const volatile __s32 nice_interactive_max = 0;
@@ -352,7 +360,15 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
     if (enable_cpuperf)
     {
         bool mem_stall = tctx->wakeups >= QS_MIN_WAKEUPS && tctx->slice_util_ewma < 40;
+        __u32 zero = 0;
         u32 perf;
+
+        if (mem_stall)
+        {
+            struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
+            if (st)
+                st->nr_mem_stall++;
+        }
 
         if (task_is_interactive(p, tctx) && !mem_stall)
         {
@@ -360,14 +376,19 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
         }
         else
         {
+            /* Use PSI-driven override when userspace sets it, else rodata default. */
+            struct qs_dynamic_cfg *dcfg = bpf_map_lookup_elem(&dynamic_cfg, &zero);
+            __u32 base = (dcfg && dcfg->batch_cpuperf_abs_override)
+                             ? dcfg->batch_cpuperf_abs_override
+                             : batch_cpuperf_abs;
+
             /* Adaptive: scale batch CPU freq up as the batch queue grows. */
-            __u32 zero = 0;
             struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
             __s64 depth = bd ? bd->depth : 0;
 
             if (depth <= 0)
             {
-                perf = batch_cpuperf_abs;
+                perf = base;
             }
             else if (depth >= QS_CPUPERF_LOAD_FULL)
             {
@@ -375,8 +396,8 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
             }
             else
             {
-                __u64 extra = (__u64)depth * (1024 - batch_cpuperf_abs) / QS_CPUPERF_LOAD_FULL;
-                perf = batch_cpuperf_abs + (u32)extra;
+                __u64 extra = (__u64)depth * (1024 - base) / QS_CPUPERF_LOAD_FULL;
+                perf = base + (u32)extra;
             }
         }
         scx_bpf_cpuperf_set(cpu, perf);

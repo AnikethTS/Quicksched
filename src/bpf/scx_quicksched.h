@@ -45,6 +45,16 @@ struct qs_stats
     __u64 nr_preempted; /* tasks that stopped before exhausting their slice */
     __u64 nr_memalloc;  /* tasks demoted to batch due to PF_MEMALLOC */
     __u64 nr_stolen;    /* tasks work-stolen from another CPU's interactive DSQ */
+    __u64 nr_mem_stall; /* dispatches where slice_util_ewma < 40 (RAM-bound) */
+};
+
+/* Written by userspace when PSI memory pressure exceeds a threshold.
+ * BPF uses batch_cpuperf_abs_override instead of the rodata default
+ * when the field is non-zero, allowing live pressure-based throttling. */
+struct qs_dynamic_cfg
+{
+    __u32 batch_cpuperf_abs_override; /* 0 = use rodata default */
+    __u32 pad;
 };
 
 struct qs_latency
