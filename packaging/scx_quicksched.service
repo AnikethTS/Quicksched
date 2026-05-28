@@ -1,6 +1,6 @@
 [Unit]
-Description=scx_snap — latency-optimised sched_ext CPU scheduler
-Documentation=man:scx_snap(1)
+Description=scx_quicksched (Quicksched) — latency-optimised sched_ext CPU scheduler
+Documentation=man:scx_quicksched(1)
 After=multi-user.target
 # Only start if the kernel exposes the sched_ext control directory.
 ConditionPathExists=/sys/kernel/sched_ext
@@ -8,7 +8,7 @@ ConditionCapability=CAP_SYS_ADMIN
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/scx_snap --no-tui
+ExecStart=/usr/local/bin/scx_quicksched --no-tui
 # Restart on crash; give the kernel a moment to revert to CFS between restarts.
 Restart=on-failure
 RestartSec=5s

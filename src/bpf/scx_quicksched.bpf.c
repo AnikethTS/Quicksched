@@ -4,7 +4,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include "scx_snap.h"
+#include "scx_quicksched.h"
 
 #define ENOMEM 12
 
@@ -15,7 +15,7 @@ struct
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
-    __type(value, struct snap_task_ctx);
+    __type(value, struct qs_task_ctx);
 } task_stor SEC(".maps");
 
 struct
@@ -23,7 +23,7 @@ struct
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct snap_stats);
+    __type(value, struct qs_stats);
 } stats SEC(".maps");
 
 struct
@@ -31,11 +31,27 @@ struct
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct snap_latency);
+    __type(value, struct qs_latency);
 } latency SEC(".maps");
 
-const volatile __u64 slice_interactive_ns = SNAP_SLICE_INTERACTIVE_NS;
-const volatile __u64 slice_batch_ns = SNAP_SLICE_BATCH_NS;
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qs_batch_depth);
+} batch_depth_map SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qs_cpu_load);
+} cpu_load SEC(".maps");
+
+const volatile __u64 slice_interactive_ns = QS_SLICE_INTERACTIVE_NS;
+const volatile __u64 slice_batch_ns = QS_SLICE_BATCH_NS;
 const volatile __s32 nice_interactive_max = 0;
 const volatile __u32 interactive_sleep_pct = 50;
 const volatile bool enable_cpuperf = true;
@@ -90,12 +106,16 @@ static __always_inline u32 log2_u64(u64 v)
 }
 
 static __always_inline bool task_is_interactive(struct task_struct *p,
-                                                struct snap_task_ctx *tctx)
+                                                struct qs_task_ctx *tctx)
 {
     __u64 total;
     __s32 nice;
 
     if (p->flags & PF_KTHREAD)
+        return false;
+
+    /* Low cgroup CPU weight → background service → force batch */
+    if (p->scx.weight > 0 && p->scx.weight < QS_BATCH_WEIGHT_MAX)
         return false;
 
     /* static_prio = MAX_RT_PRIO(100) + 20 + nice */
@@ -107,7 +127,7 @@ static __always_inline bool task_is_interactive(struct task_struct *p,
     if (nice <= nice_interactive_max)
         return true;
 
-    if (tctx->wakeups < SNAP_MIN_WAKEUPS)
+    if (tctx->wakeups < QS_MIN_WAKEUPS)
         return false;
 
     total = tctx->sum_run_ns + tctx->sum_sleep_ns;
@@ -119,7 +139,7 @@ static __always_inline bool task_is_interactive(struct task_struct *p,
 
 static __always_inline void record_latency(u64 enqueue_at)
 {
-    struct snap_latency *lat;
+    struct qs_latency *lat;
     u64 now, delta_ns, delta_us;
     u32 bucket, zero = 0;
 
@@ -132,8 +152,8 @@ static __always_inline void record_latency(u64 enqueue_at)
 
     bucket = delta_us == 0 ? 0 : log2_u64(delta_us) + 1;
 
-    if (bucket >= SNAP_LAT_BUCKETS)
-        bucket = SNAP_LAT_BUCKETS - 1;
+    if (bucket >= QS_LAT_BUCKETS)
+        bucket = QS_LAT_BUCKETS - 1;
 
     lat = bpf_map_lookup_elem(&latency, &zero);
     if (lat)
@@ -151,10 +171,10 @@ static __always_inline void record_latency(u64 enqueue_at)
  * We return int; the kernel ignores the value for void-typed slots.
  */
 
-SEC("struct_ops/scx_snap_runnable")
-int BPF_PROG(scx_snap_runnable, struct task_struct *p, u64 enq_flags)
+SEC("struct_ops/scx_quicksched_runnable")
+int BPF_PROG(scx_quicksched_runnable, struct task_struct *p, u64 enq_flags)
 {
-    struct snap_task_ctx *tctx;
+    struct qs_task_ctx *tctx;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
@@ -164,7 +184,7 @@ int BPF_PROG(scx_snap_runnable, struct task_struct *p, u64 enq_flags)
     {
         __u64 sleep_dur = scx_bpf_now() - tctx->sleep_at;
 
-        tctx->sum_sleep_ns = (tctx->sum_sleep_ns * SNAP_EWMA_WEIGHT + sleep_dur) / (SNAP_EWMA_WEIGHT + 1);
+        tctx->sum_sleep_ns = (tctx->sum_sleep_ns * QS_EWMA_WEIGHT + sleep_dur) / (QS_EWMA_WEIGHT + 1);
         tctx->wakeups++;
         tctx->sleep_at = 0;
         tctx->enqueue_at = scx_bpf_now();
@@ -172,10 +192,10 @@ int BPF_PROG(scx_snap_runnable, struct task_struct *p, u64 enq_flags)
     return 0;
 }
 
-SEC("struct_ops/scx_snap_select_cpu")
-s32 BPF_PROG(scx_snap_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+SEC("struct_ops/scx_quicksched_select_cpu")
+s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-    struct snap_task_ctx *tctx;
+    struct qs_task_ctx *tctx;
     bool is_idle = false;
     s32 cpu;
 
@@ -189,7 +209,7 @@ s32 BPF_PROG(scx_snap_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
             bool interactive = task_is_interactive(p, tctx);
             __u64 slice = interactive ? slice_interactive_ns : slice_batch_ns;
             __u32 zero = 0;
-            struct snap_stats *st;
+            struct qs_stats *st;
 
             tctx->assigned_slice_ns = slice;
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
@@ -203,11 +223,11 @@ s32 BPF_PROG(scx_snap_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
     return cpu;
 }
 
-SEC("struct_ops/scx_snap_enqueue")
-int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
+SEC("struct_ops/scx_quicksched_enqueue")
+int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 {
-    struct snap_task_ctx *tctx;
-    struct snap_stats *st;
+    struct qs_task_ctx *tctx;
+    struct qs_stats *st;
     bool interactive;
     __u64 slice, dsq_flags = 0;
     __u64 dsq_id;
@@ -216,17 +236,20 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (p->flags & PF_MEMALLOC)
     {
-        scx_bpf_dsq_insert(p, SNAP_DSQ_BATCH, slice_batch_ns, enq_flags);
+        scx_bpf_dsq_insert(p, QS_DSQ_BATCH, slice_batch_ns, enq_flags);
         st = bpf_map_lookup_elem(&stats, &zero);
         if (st)
             st->nr_memalloc++;
+        struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
+        if (bd)
+            __sync_fetch_and_add(&bd->depth, 1LL);
         return 0;
     }
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
     {
-        scx_bpf_dsq_insert(p, SNAP_DSQ_BATCH, slice_batch_ns, enq_flags);
+        scx_bpf_dsq_insert(p, QS_DSQ_BATCH, slice_batch_ns, enq_flags);
         return 0;
     }
 
@@ -236,7 +259,7 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
     if (interactive)
     {
         slice = slice_interactive_ns;
-        dsq_id = (sel_cpu >= 0 && sel_cpu < SNAP_MAX_CPUS)
+        dsq_id = (sel_cpu >= 0 && sel_cpu < QS_MAX_CPUS)
                      ? (u64)sel_cpu
                      : 0;
 
@@ -249,7 +272,10 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
     else
     {
         slice = slice_batch_ns;
-        dsq_id = SNAP_DSQ_BATCH;
+        dsq_id = QS_DSQ_BATCH;
+        struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
+        if (bd)
+            __sync_fetch_and_add(&bd->depth, 1LL);
     }
 
     tctx->assigned_slice_ns = slice;
@@ -266,19 +292,56 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
     return 0;
 }
 
-SEC("struct_ops/scx_snap_dispatch")
-int BPF_PROG(scx_snap_dispatch, s32 cpu, struct task_struct *prev)
+SEC("struct_ops/scx_quicksched_dispatch")
+int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
 {
-    if (cpu >= 0 && cpu < SNAP_MAX_CPUS && scx_bpf_dsq_move_to_local((u64)cpu))
-        return 0;
-    scx_bpf_dsq_move_to_local(SNAP_DSQ_BATCH);
+    u32 nr_cpus = scx_bpf_nr_cpu_ids();
+    __u32 zero = 0;
+    struct qs_cpu_load *cl;
+
+    /* Own interactive DSQ */
+    if (cpu >= 0 && (u32)cpu < nr_cpus && scx_bpf_dsq_move_to_local((u64)cpu))
+        goto dispatched;
+
+    /* Work-steal from up to 8 neighbouring CPUs' interactive DSQs.
+     * This also drains interactive queues of CPUs going offline. */
+    if (cpu >= 0)
+    {
+        for (u32 i = 1; i <= 8; i++)
+        {
+            u32 steal = ((u32)cpu + i) % nr_cpus;
+            if (scx_bpf_dsq_move_to_local((u64)steal))
+            {
+                struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
+                if (st)
+                    st->nr_stolen++;
+                goto dispatched;
+            }
+        }
+    }
+
+    /* Global batch DSQ */
+    if (scx_bpf_dsq_move_to_local(QS_DSQ_BATCH))
+    {
+        struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
+        if (bd)
+            __sync_fetch_and_add(&bd->depth, -1LL);
+        goto dispatched;
+    }
+
+    return 0;
+
+dispatched:
+    cl = bpf_map_lookup_elem(&cpu_load, &zero);
+    if (cl)
+        cl->nr_dispatch++;
     return 0;
 }
 
-SEC("struct_ops/scx_snap_running")
-int BPF_PROG(scx_snap_running, struct task_struct *p)
+SEC("struct_ops/scx_quicksched_running")
+int BPF_PROG(scx_quicksched_running, struct task_struct *p)
 {
-    struct snap_task_ctx *tctx;
+    struct qs_task_ctx *tctx;
     s32 cpu;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
@@ -291,10 +354,35 @@ int BPF_PROG(scx_snap_running, struct task_struct *p)
 
     if (enable_cpuperf)
     {
-        /* Memory-stall-bound tasks gain nothing from higher CPU frequency. */
-        bool mem_stall = tctx->wakeups >= SNAP_MIN_WAKEUPS &&
+        bool mem_stall = tctx->wakeups >= QS_MIN_WAKEUPS &&
                          tctx->slice_util_ewma < 40;
-        u32 perf = (task_is_interactive(p, tctx) && !mem_stall) ? 1024 : batch_cpuperf_abs;
+        u32 perf;
+
+        if (task_is_interactive(p, tctx) && !mem_stall)
+        {
+            perf = 1024;
+        }
+        else
+        {
+            /* Adaptive: scale batch CPU freq up as the batch queue grows. */
+            __u32 zero = 0;
+            struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
+            __s64 depth = bd ? bd->depth : 0;
+
+            if (depth <= 0)
+            {
+                perf = batch_cpuperf_abs;
+            }
+            else if (depth >= QS_CPUPERF_LOAD_FULL)
+            {
+                perf = 1024;
+            }
+            else
+            {
+                __u64 extra = (__u64)depth * (1024 - batch_cpuperf_abs) / QS_CPUPERF_LOAD_FULL;
+                perf = batch_cpuperf_abs + (u32)extra;
+            }
+        }
         scx_bpf_cpuperf_set(cpu, perf);
     }
 
@@ -306,10 +394,10 @@ int BPF_PROG(scx_snap_running, struct task_struct *p)
     return 0;
 }
 
-SEC("struct_ops/scx_snap_stopping")
-int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
+SEC("struct_ops/scx_quicksched_stopping")
+int BPF_PROG(scx_quicksched_stopping, struct task_struct *p, bool runnable)
 {
-    struct snap_task_ctx *tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
+    struct qs_task_ctx *tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
 
     if (!tctx)
         return 0;
@@ -318,7 +406,7 @@ int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
     {
         __u64 run_dur = scx_bpf_now() - tctx->run_at;
 
-        tctx->sum_run_ns = (tctx->sum_run_ns * SNAP_EWMA_WEIGHT + run_dur) / (SNAP_EWMA_WEIGHT + 1);
+        tctx->sum_run_ns = (tctx->sum_run_ns * QS_EWMA_WEIGHT + run_dur) / (QS_EWMA_WEIGHT + 1);
         tctx->run_at = 0;
 
         if (tctx->assigned_slice_ns > 0)
@@ -327,13 +415,13 @@ int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
             if (util > 100)
                 util = 100;
             tctx->slice_util_ewma =
-                (tctx->slice_util_ewma * SNAP_EWMA_WEIGHT + util) / (SNAP_EWMA_WEIGHT + 1);
+                (tctx->slice_util_ewma * QS_EWMA_WEIGHT + util) / (QS_EWMA_WEIGHT + 1);
 
             /* Stayed runnable but used <90% of slice → preempted or stalled. */
             if (runnable && util < 90)
             {
                 __u32 zero = 0;
-                struct snap_stats *st = bpf_map_lookup_elem(&stats, &zero);
+                struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
                 if (st)
                     st->nr_preempted++;
             }
@@ -345,10 +433,10 @@ int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
     return 0;
 }
 
-SEC("struct_ops/scx_snap_init_task")
-s32 BPF_PROG(scx_snap_init_task, struct task_struct *p, struct scx_init_task_args *args)
+SEC("struct_ops/scx_quicksched_init_task")
+s32 BPF_PROG(scx_quicksched_init_task, struct task_struct *p, struct scx_init_task_args *args)
 {
-    struct snap_task_ctx *tctx;
+    struct qs_task_ctx *tctx;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!tctx)
@@ -360,26 +448,46 @@ s32 BPF_PROG(scx_snap_init_task, struct task_struct *p, struct scx_init_task_arg
     tctx->sleep_at = 0;
     tctx->enqueue_at = 0;
     tctx->assigned_slice_ns = 0;
-    tctx->slice_util_ewma = 100; /* assume CPU-bound until we observe otherwise */
     tctx->wakeups = 0;
+    /* Start optimistic so a new task isn't penalised before its first wakeup. */
+    tctx->slice_util_ewma = 100;
 
     return 0;
 }
 
-SEC("struct_ops/scx_snap_exit_task")
-int BPF_PROG(scx_snap_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+SEC("struct_ops/scx_quicksched_exit_task")
+int BPF_PROG(scx_quicksched_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
     return 0;
 }
 
-SEC("struct_ops.s/scx_snap_init")
-s32 scx_snap_init(void)
+SEC("struct_ops.s/scx_quicksched_cpu_online")
+int BPF_PROG(scx_quicksched_cpu_online, s32 cpu)
+{
+    /* A CPU came online (e.g. hotplug). Ensure its interactive DSQ exists.
+     * If scx_quicksched_init already created it, scx_bpf_create_dsq returns
+     * -EEXIST which is harmless. */
+    if (cpu >= 0 && cpu < QS_MAX_CPUS)
+        scx_bpf_create_dsq((u64)cpu, -1);
+    return 0;
+}
+
+SEC("struct_ops/scx_quicksched_cpu_offline")
+int BPF_PROG(scx_quicksched_cpu_offline, s32 cpu)
+{
+    /* Work-stealing in dispatch will drain this CPU's interactive DSQ
+     * once it stops consuming tasks.  No explicit action required. */
+    return 0;
+}
+
+SEC("struct_ops.s/scx_quicksched_init")
+s32 scx_quicksched_init(void)
 {
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
     u32 cpu;
     int ret;
 
-    for (cpu = 0; cpu < SNAP_MAX_CPUS; cpu++)
+    for (cpu = 0; cpu < QS_MAX_CPUS; cpu++)
     {
         if (cpu >= nr_cpus)
             break;
@@ -388,28 +496,30 @@ s32 scx_snap_init(void)
             return ret;
     }
 
-    return scx_bpf_create_dsq(SNAP_DSQ_BATCH, -1);
+    return scx_bpf_create_dsq(QS_DSQ_BATCH, -1);
 }
 
-SEC("struct_ops/scx_snap_exit")
-int BPF_PROG(scx_snap_exit, struct scx_exit_info *ei)
+SEC("struct_ops/scx_quicksched_exit")
+int BPF_PROG(scx_quicksched_exit, struct scx_exit_info *ei)
 {
     return 0;
 }
 
 SEC(".struct_ops")
-struct sched_ext_ops scx_snap_ops = {
-    .select_cpu = (void *)scx_snap_select_cpu,
-    .enqueue = (void *)scx_snap_enqueue,
-    .dispatch = (void *)scx_snap_dispatch,
-    .runnable = (void *)scx_snap_runnable,
-    .running = (void *)scx_snap_running,
-    .stopping = (void *)scx_snap_stopping,
-    .init_task = (void *)scx_snap_init_task,
-    .exit_task = (void *)scx_snap_exit_task,
-    .init = (void *)scx_snap_init,
-    .exit = (void *)scx_snap_exit,
-    .timeout_ms = 30000,
-    .flags = SCX_OPS_KEEP_BUILTIN_IDLE,
-    .name = "scx_snap",
+struct sched_ext_ops scx_quicksched_ops = {
+    .select_cpu  = (void *)scx_quicksched_select_cpu,
+    .enqueue     = (void *)scx_quicksched_enqueue,
+    .dispatch    = (void *)scx_quicksched_dispatch,
+    .runnable    = (void *)scx_quicksched_runnable,
+    .running     = (void *)scx_quicksched_running,
+    .stopping    = (void *)scx_quicksched_stopping,
+    .init_task   = (void *)scx_quicksched_init_task,
+    .exit_task   = (void *)scx_quicksched_exit_task,
+    .cpu_online  = (void *)scx_quicksched_cpu_online,
+    .cpu_offline = (void *)scx_quicksched_cpu_offline,
+    .init        = (void *)scx_quicksched_init,
+    .exit        = (void *)scx_quicksched_exit,
+    .timeout_ms  = 30000,
+    .flags       = SCX_OPS_KEEP_BUILTIN_IDLE,
+    .name        = "scx_quicksched",
 };
