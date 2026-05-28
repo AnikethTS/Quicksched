@@ -1,0 +1,124 @@
+.TH SCX_QUICKSCHED 1 "2026-05-28" "Quicksched" "User Commands"
+.SH NAME
+scx_quicksched \- latency-optimised sched_ext CPU scheduler
+.SH SYNOPSIS
+.B scx_quicksched
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+\fBscx_quicksched\fR (Quicksched) is a BPF-based CPU scheduler that replaces
+the kernel's default CFS scheduler using the \fIsched_ext\fR framework
+(kernel \(>= 6.12).
+.PP
+Tasks are classified as \fIinteractive\fR or \fIbatch\fR based on their nice
+value and historical sleep ratio.  Interactive tasks receive a short time slice
+and run at full CPU frequency; batch tasks receive a longer slice and are
+throttled to a configurable fraction of maximum frequency.  Tasks performing
+direct memory reclaim (\fBPF_MEMALLOC\fR) are always forced to the batch
+queue.  Tasks whose slice-utilisation EWMA falls below 40% are treated as
+memory-stall-bound and capped at batch CPU frequency regardless of their
+interactive classification.
+.PP
+Requires root and \fBCONFIG_SCHED_CLASS_EXT=y\fR.
+.SH OPTIONS
+.TP
+.BR \-i ", " \-\-interactive\-slice\-us " " \fIN\fR
+Interactive task time slice in microseconds (default: \fB5000\fR).
+.TP
+.BR \-b ", " \-\-batch\-slice\-us " " \fIN\fR
+Batch task time slice in microseconds (default: \fB20000\fR).
+.TP
+.BR \-n ", " \-\-nice\-interactive\-max " " \fIN\fR
+Tasks with nice \(<= \fIN\fR are unconditionally interactive (default: \fB0\fR).
+.TP
+.BR \-p ", " \-\-interactive\-sleep\-pct " " \fIN\fR
+Minimum lifetime sleep percentage for interactive classification (default: \fB50\fR).
+.TP
+.B \-\-batch\-cpuperf\-pct " " \fIN\fR
+CPU frequency cap for batch tasks, as a percentage of the hardware maximum
+(default: \fB50\fR).
+.TP
+.B \-\-no\-cpuperf
+Disable CPU frequency scaling entirely.
+.TP
+.B \-\-no\-tui
+Plain text output instead of the ncurses TUI.  Useful for running under
+systemd or in scripts.
+.TP
+.B \-\-slo\-us " " \fIN\fR
+Alert when p99 wakeup latency exceeds \fIN\fR microseconds (default: 0 = off).
+.TP
+.BR \-s ", " \-\-stats\-interval " " \fIN\fR
+Stats reporting interval in seconds (default: \fB1\fR).  Set to 0 to disable
+stats output while still running the scheduler.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose libbpf diagnostic output.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.SH TASK CLASSIFICATION
+A task is \fIinteractive\fR when any of the following hold:
+.IP \[bu] 2
+It has a negative nice value.
+.IP \[bu]
+Its nice value is \(<= \fB\-\-nice\-interactive\-max\fR.
+.IP \[bu]
+After accumulating at least 4 wakeups, its lifetime sleep time is \(>=
+\fB\-\-interactive\-sleep\-pct\fR percent.
+.PP
+Kernel threads are always classified as batch.
+.SH KERNEL COMPATIBILITY
+.TS
+tab(@) allbox;
+lb lb
+l l.
+Kernel@Status
+< 6.12@Not supported (no sched_ext)
+6.12 \(en 6.16@Fully supported
+6.17+@Supported; requires BPF_PROG context wrapper (bundled)
+.TE
+.SH FILES
+.TP
+.I /sys/kernel/sched_ext
+sched_ext control directory.  Present only when the running kernel was built
+with \fBCONFIG_SCHED_CLASS_EXT=y\fR.
+.TP
+.I /lib/systemd/system/scx_quicksched.service
+systemd unit installed by \fBmake install\fR.
+.SH EXAMPLES
+Run with the interactive TUI:
+.RS
+.nf
+sudo scx_quicksched
+.fi
+.RE
+.PP
+Run as a systemd service:
+.RS
+.nf
+sudo make install
+sudo systemctl enable --now scx_quicksched
+.fi
+.RE
+.PP
+Tune for an audio workstation (2 ms interactive slice, batch at 25% freq):
+.RS
+.nf
+sudo scx_quicksched \-i 2000 \-\-batch\-cpuperf\-pct 25
+.fi
+.RE
+.SH SAFETY
+When the \fBscx_quicksched\fR process exits or is killed, the BPF struct_ops
+link is released and the kernel automatically reverts all tasks to CFS.  The
+scheduler also sets \fBtimeout_ms\fR in the ops struct so that the kernel will
+self-revert if any task fails to make progress for more than 30 seconds.
+.SH SEE ALSO
+.BR chrt (1),
+.BR nice (1),
+.BR renice (1),
+.BR systemctl (1)
+.SH AUTHORS
+Aniketh T S and contributors.
