@@ -19,7 +19,7 @@ jobs:
         distro: [noble, oracular, plucky, jammy]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Install packaging tools
         run: |
@@ -46,7 +46,7 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
           DISTRO=${{ matrix.distro }}
-          DEB_VERSION="${VERSION}-1~${DISTRO}1"
+          DEB_VERSION="${VERSION}~${DISTRO}1"
           DATE=$(date -R)
           # Rewrite the first changelog stanza with correct version + distro
           sed -i "1s/.*/scx-quicksched (${DEB_VERSION}) ${DISTRO}; urgency=medium/" debian/changelog
@@ -55,7 +55,7 @@ jobs:
 
       - name: Build source package
         run: |
-          dpkg-buildpackage -S -sa -k"${{ secrets.PPA_GPG_KEY_ID }}" -d
+          dpkg-buildpackage -S -k"${{ secrets.PPA_GPG_KEY_ID }}" -d
         env:
           DEBSIGN_KEYID: ${{ secrets.PPA_GPG_KEY_ID }}
 
@@ -63,6 +63,6 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
           DISTRO=${{ matrix.distro }}
-          DEB_VERSION="${VERSION}-1~${DISTRO}1"
+          DEB_VERSION="${VERSION}~${DISTRO}1"
           dput ppa:anikethts/quicksched \
             ../scx-quicksched_${DEB_VERSION}_source.changes
