@@ -93,15 +93,12 @@ jobs:
 
       - name: Verify binary
         if: steps.scx.outputs.available == 'true'
-        run: |
-          test -f scx_quicksched
-          file scx_quicksched
+        run: test -f scx_quicksched
 
       - name: Fallback (no sched_ext kernel)
         if: steps.scx.outputs.available == 'false'
         run: |
           echo "Skipping BPF build — sched_ext not available"
-          echo "Verifying pkg-config and source compileability..."
           pkg-config --modversion libbpf
           pkg-config --modversion ncurses
 
@@ -142,15 +139,12 @@ jobs:
 
       - name: Verify binary
         if: steps.scx.outputs.available == 'true'
-        run: |
-          test -f scx_quicksched
-          file scx_quicksched
+        run: test -f scx_quicksched
 
       - name: Fallback (no sched_ext kernel)
         if: steps.scx.outputs.available == 'false'
         run: |
           echo "Skipping BPF build — sched_ext not available"
-          echo "Verifying pkg-config and source compileability..."
           pkg-config --modversion libbpf
           pkg-config --modversion ncurses
 
