@@ -57,12 +57,35 @@ static __always_inline u32 log2_u64(u64 v)
 {
     u32 r = 0;
 
-    if (v >= (1ULL << 32)) { v >>= 32; r += 32; }
-    if (v >= (1ULL << 16)) { v >>= 16; r += 16; }
-    if (v >= (1ULL << 8))  { v >>= 8;  r += 8;  }
-    if (v >= (1ULL << 4))  { v >>= 4;  r += 4;  }
-    if (v >= (1ULL << 2))  { v >>= 2;  r += 2;  }
-    if (v >= (1ULL << 1))  { r += 1; }
+    if (v >= (1ULL << 32))
+    {
+        v >>= 32;
+        r += 32;
+    }
+    if (v >= (1ULL << 16))
+    {
+        v >>= 16;
+        r += 16;
+    }
+    if (v >= (1ULL << 8))
+    {
+        v >>= 8;
+        r += 8;
+    }
+    if (v >= (1ULL << 4))
+    {
+        v >>= 4;
+        r += 4;
+    }
+    if (v >= (1ULL << 2))
+    {
+        v >>= 2;
+        r += 2;
+    }
+    if (v >= (1ULL << 1))
+    {
+        r += 1;
+    }
     return r;
 }
 
@@ -386,6 +409,7 @@ struct sched_ext_ops scx_snap_ops = {
     .exit_task = (void *)scx_snap_exit_task,
     .init = (void *)scx_snap_init,
     .exit = (void *)scx_snap_exit,
+    .timeout_ms = 30000,
     .flags = SCX_OPS_KEEP_BUILTIN_IDLE,
     .name = "scx_snap",
 };
