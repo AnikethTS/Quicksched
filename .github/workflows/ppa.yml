@@ -1,0 +1,68 @@
+name: PPA Upload
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (without v prefix, e.g. 0.2.0)'
+        required: true
+
+jobs:
+  upload-ppa:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [noble, oracular, plucky, jammy]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y devscripts debhelper dput gpg
+
+      - name: Import GPG signing key
+        run: |
+          echo "$PPA_GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys
+        env:
+          PPA_GPG_PRIVATE_KEY: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stamp changelog for ${{ matrix.distro }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          DISTRO=${{ matrix.distro }}
+          DEB_VERSION="${VERSION}-1~${DISTRO}1"
+          DATE=$(date -R)
+          # Rewrite the first changelog stanza with correct version + distro
+          sed -i "1s/.*/scx-quicksched (${DEB_VERSION}) ${DISTRO}; urgency=medium/" debian/changelog
+          # Fix the trailer date line too
+          sed -i "s/^ -- Aniketh T S.*/ -- Aniketh T S <anikethtsts@gmail.com>  ${DATE}/" debian/changelog
+
+      - name: Build source package
+        run: |
+          dpkg-buildpackage -S -sa -k"${{ secrets.PPA_GPG_KEY_ID }}" -d
+        env:
+          DEBSIGN_KEYID: ${{ secrets.PPA_GPG_KEY_ID }}
+
+      - name: Upload to Launchpad PPA
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          DISTRO=${{ matrix.distro }}
+          DEB_VERSION="${VERSION}-1~${DISTRO}1"
+          dput ppa:anikethts/quicksched \
+            ../scx-quicksched_${DEB_VERSION}_source.changes

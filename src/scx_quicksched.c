@@ -466,6 +466,10 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
 
     attron(COLOR_PAIR(CP_DIM));
     mvprintw(rows - 1, 2, " developed by Aniketh T S ");
+    {
+        const char *contrib = " contribute: github.com/AnikethTS/Quicksched ";
+        mvprintw(rows - 1, cols - (int)strlen(contrib) - 1, "%s", contrib);
+    }
     attroff(COLOR_PAIR(CP_DIM));
 
     refresh();

@@ -1,0 +1,30 @@
+Source: scx-quicksched
+Section: utils
+Priority: optional
+Maintainer: Aniketh T S <anikethtsts@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               clang,
+               gcc,
+               libbpf-dev,
+               libncurses-dev,
+               linux-tools-generic | bpftool,
+               linux-headers-generic
+Standards-Version: 4.6.2
+Homepage: https://github.com/AnikethTS/Quicksched
+Vcs-Git: https://github.com/AnikethTS/Quicksched.git
+Vcs-Browser: https://github.com/AnikethTS/Quicksched
+
+Package: scx-quicksched
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Latency-optimised sched_ext CPU scheduler
+ Quicksched is a BPF-based CPU scheduler built on sched_ext that keeps
+ interactive tasks snappy by separating them from batch and background work.
+ .
+ Tasks are classified into two tiers: interactive (short 5 ms slices, runs at
+ full CPU frequency) and batch (20 ms slices, throttled CPU frequency).
+ Classification uses nice value and an EWMA sleep-ratio so I/O-bound tasks are
+ promoted automatically without manual tuning. Memory pressure (PSI) is also
+ tracked and fed back to the scheduler via BPF maps for live throttling.
+ .
+ Requires Linux kernel >= 6.12 with CONFIG_SCHED_CLASS_EXT=y.

@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Ensure bpftool is in PATH — on Ubuntu it lives under /usr/lib/linux-tools/<kver>/
+	export PATH="$$PATH:/usr/lib/linux-tools/$$(uname -r)"; \
+	$(MAKE) PREFIX=/usr
+
+override_dh_auto_install:
+	$(MAKE) install PREFIX=/usr DESTDIR=$(CURDIR)/debian/scx-quicksched
+
+override_dh_auto_clean:
+	$(MAKE) clean-full || true
