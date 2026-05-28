@@ -20,7 +20,13 @@ KVER := $(shell uname -r)
 
 CFLAGS    := -O2 -g -Wall -Wextra
 BPF_FLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -fno-stack-protector
-LDFLAGS   := -L/usr/lib64 -Wl,-rpath,/usr/lib64
+
+# Resolve library flags via pkg-config so the build works on all distros
+# (Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE) without hardcoded paths.
+LIBBPF_CFLAGS  := $(shell pkg-config --cflags libbpf  2>/dev/null)
+LIBBPF_LDFLAGS := $(shell pkg-config --libs   libbpf  2>/dev/null || echo "-lbpf")
+NCURSES_CFLAGS  := $(shell pkg-config --cflags ncurses 2>/dev/null)
+NCURSES_LDFLAGS := $(shell pkg-config --libs   ncurses 2>/dev/null || echo "-lncurses")
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
@@ -40,13 +46,13 @@ all: check-deps $(TARGET)
 
 check-deps:
 	@command -v $(BPF_CC) >/dev/null 2>&1 || \
-		{ echo "error: clang not found — install clang"; exit 1; }
+		{ echo "error: clang not found — run: sudo scripts/install-deps.sh"; exit 1; }
 	@command -v bpftool >/dev/null 2>&1 || \
-		{ echo "error: bpftool not found — install linux-tools-$(KVER) or bpftool"; exit 1; }
+		{ echo "error: bpftool not found — run: sudo scripts/install-deps.sh"; exit 1; }
 	@pkg-config --exists libbpf 2>/dev/null || \
-		{ echo "error: libbpf not found — install libbpf-dev"; exit 1; }
+		{ echo "error: libbpf not found — run: sudo scripts/install-deps.sh"; exit 1; }
 	@pkg-config --exists ncurses 2>/dev/null || \
-		{ echo "error: ncurses not found — install libncurses-dev"; exit 1; }
+		{ echo "error: ncurses not found — run: sudo scripts/install-deps.sh"; exit 1; }
 
 $(BUILDDIR):
 	mkdir -p $@
@@ -61,14 +67,15 @@ $(VMLINUX_STAMP): | $(BUILDDIR)
 $(VMLINUX): $(VMLINUX_STAMP)
 
 $(BPF_OBJ): src/bpf/scx_quicksched.bpf.c src/bpf/scx_quicksched.h $(VMLINUX) | $(BUILDDIR)
-	$(BPF_CC) $(BPF_FLAGS) -I$(BUILDDIR) -Isrc/bpf -I/usr/include -c $< -o $@
+	$(BPF_CC) $(BPF_FLAGS) $(LIBBPF_CFLAGS) -I$(BUILDDIR) -Isrc/bpf -I/usr/include -c $< -o $@
 
 $(SKEL_H): $(BPF_OBJ) | $(BUILDDIR)
 	bpftool gen skeleton $< > $@
 
 $(TARGET): src/scx_quicksched.c src/bpf/scx_quicksched.h $(SKEL_H)
-	$(CC) $(CFLAGS) -I$(BUILDDIR) -Isrc/bpf $< $(LDFLAGS) -lbpf -lncurses -o $@
-
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(NCURSES_CFLAGS) \
+		-I$(BUILDDIR) -Isrc/bpf $< \
+		$(LIBBPF_LDFLAGS) $(NCURSES_LDFLAGS) -o $@
 
 install: $(TARGET)
 	install -Dm755 $(TARGET)                          $(DESTDIR)$(BINDIR)/$(TARGET)

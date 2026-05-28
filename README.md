@@ -33,11 +33,23 @@ The BPF struct_ops link is tied to the userspace process file descriptor. If `sc
 ## Requirements
 
 - Linux kernel ≥ 6.12 with `CONFIG_SCHED_CLASS_EXT=y`
-- `clang`, `gcc`, `bpftool`, `libbpf-dev`, `libncurses-dev`
+- `clang`, `gcc`, `bpftool`, `libbpf`, `ncurses`
+
+The quickest way to install all dependencies is the bundled script — it auto-detects your distro:
 
 ```sh
-sudo apt install clang gcc libbpf-dev libncurses-dev linux-tools-$(uname -r)
+sudo scripts/install-deps.sh
 ```
+
+Or install manually for your distro:
+
+| Distro | Command |
+|--------|---------|
+| **Ubuntu / Debian** | `sudo apt install clang gcc libbpf-dev libncurses-dev linux-tools-$(uname -r)` |
+| **Fedora** | `sudo dnf install clang gcc libbpf-devel ncurses-devel bpftool` |
+| **RHEL / AlmaLinux / Rocky** | `sudo dnf install epel-release && sudo dnf install clang gcc libbpf-devel ncurses-devel bpftool` |
+| **Arch Linux** | `sudo pacman -S clang gcc libbpf ncurses bpf` |
+| **openSUSE** | `sudo zypper install clang gcc libbpf-devel ncurses-devel bpftool` |
 
 ## Build
 
@@ -117,11 +129,15 @@ src/
   bpf/
     scx_quicksched.bpf.c    BPF scheduler implementation
     scx_quicksched.h        shared types and constants
+scripts/
+  install-deps.sh           auto-detects distro and installs build dependencies
 man/
   scx_quicksched.1          man page
 packaging/
   scx_quicksched.service    systemd unit file
+  scx_quicksched.spec       RPM spec (Fedora / RHEL / openSUSE)
+  PKGBUILD                  Arch Linux package build script
 .github/workflows/
-  ci.yml              GitHub Actions CI
+  ci.yml                    CI: Ubuntu, Fedora, Arch, sanitizers, clang-format
 Makefile
 ```
