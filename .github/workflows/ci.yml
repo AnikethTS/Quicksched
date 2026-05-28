@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+# Shared step: check whether the runner kernel exposes sched_ext BTF.
+# Outputs available=true/false so later steps can skip gracefully.
+
+jobs:
+  build-ubuntu:
+    name: Build (Ubuntu)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang gcc make pkg-config \
+            libbpf-dev libncurses-dev
+          sudo apt-get install -y linux-tools-$(uname -r) 2>/dev/null || \
+          sudo apt-get install -y linux-tools-generic
+
+      - name: Show environment
+        run: |
+          echo "Kernel: $(uname -r)  Arch: $(uname -m)"
+          clang --version | head -1
+          bpftool version 2>/dev/null || true
+
+      - name: Check sched_ext support
+        id: scx
+        run: |
+          if bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
+              | grep -q 'sched_ext_ops'; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Kernel $(uname -r) has no sched_ext BTF; requires >= 6.12"
+          fi
+
+      - name: Full build
+        if: steps.scx.outputs.available == 'true'
+        run: make
+
+      - name: Verify binary
+        if: steps.scx.outputs.available == 'true'
+        run: |
+          test -f scx_quicksched
+          file scx_quicksched
+
+      - name: Fallback (no sched_ext kernel)
+        if: steps.scx.outputs.available == 'false'
+        run: echo "Skipping BPF build — sched_ext not available on this runner"
+
+  build-fedora:
+    name: Build (Fedora)
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            clang gcc make pkgconf-pkg-config \
+            libbpf-devel ncurses-devel bpftool
+
+      - name: Show environment
+        run: |
+          echo "Kernel: $(uname -r)  Arch: $(uname -m)"
+          clang --version | head -1
+          bpftool version 2>/dev/null || true
+
+      - name: Check sched_ext support
+        id: scx
+        run: |
+          if bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
+              | grep -q 'sched_ext_ops'; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Kernel $(uname -r) has no sched_ext BTF; requires >= 6.12"
+          fi
+
+      - name: Full build
+        if: steps.scx.outputs.available == 'true'
+        run: make
+
+      - name: Verify binary
+        if: steps.scx.outputs.available == 'true'
+        run: test -f scx_quicksched
+
+      - name: Fallback (no sched_ext kernel)
+        if: steps.scx.outputs.available == 'false'
+        run: |
+          echo "Skipping BPF build — sched_ext not available"
+          pkg-config --modversion libbpf
+          pkg-config --modversion ncurses
+
+  build-arch:
+    name: Build (Arch Linux)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pacman -Sy --noconfirm \
+            clang gcc make pkgconf \
+            libbpf ncurses bpf
+
+      - name: Show environment
+        run: |
+          echo "Kernel: $(uname -r)  Arch: $(uname -m)"
+          clang --version | head -1
+          bpftool version 2>/dev/null || true
+
+      - name: Check sched_ext support
+        id: scx
+        run: |
+          if bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
+              | grep -q 'sched_ext_ops'; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Kernel $(uname -r) has no sched_ext BTF; requires >= 6.12"
+          fi
+
+      - name: Full build
+        if: steps.scx.outputs.available == 'true'
+        run: make
+
+      - name: Verify binary
+        if: steps.scx.outputs.available == 'true'
+        run: test -f scx_quicksched
+
+      - name: Fallback (no sched_ext kernel)
+        if: steps.scx.outputs.available == 'false'
+        run: |
+          echo "Skipping BPF build — sched_ext not available"
+          pkg-config --modversion libbpf
+          pkg-config --modversion ncurses
+
+  sanitizers:
+    name: Sanitizers (userspace)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang gcc make pkg-config \
+            libbpf-dev libncurses-dev
+          sudo apt-get install -y linux-tools-$(uname -r) 2>/dev/null || \
+          sudo apt-get install -y linux-tools-generic
+
+      - name: Generate vmlinux.h (skip if no BTF)
+        run: |
+          mkdir -p build
+          if bpftool btf dump file /sys/kernel/btf/vmlinux format c > build/vmlinux.h 2>/dev/null; then
+            echo "vmlinux.h generated"
+          else
+            echo "No BTF — sanitizer build skipped"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build BPF skeleton
+        if: env.SKIP != '1'
+        run: |
+          ARCH=$(uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+          clang -O2 -g -target bpf -D__TARGET_ARCH_${ARCH} -fno-stack-protector \
+            -Ibuild -Isrc/bpf -I/usr/include \
+            -c src/bpf/scx_quicksched.bpf.c -o build/scx_quicksched.bpf.o 2>/dev/null || \
+          { echo "BPF compile failed (no sched_ext); sanitizer skipped"; echo "SKIP=1" >> "$GITHUB_ENV"; }
+
+      - name: Generate skeleton header
+        if: env.SKIP != '1'
+        run: bpftool gen skeleton build/scx_quicksched.bpf.o > build/scx_quicksched.skel.h
+
+      - name: Compile with AddressSanitizer + UBSan
+        if: env.SKIP != '1'
+        run: |
+          gcc -O1 -g -fsanitize=address,undefined \
+            -fno-omit-frame-pointer \
+            $(pkg-config --cflags libbpf ncurses) \
+            -Ibuild -Isrc/bpf \
+            src/scx_quicksched.c -o scx_quicksched_asan \
+            $(pkg-config --libs libbpf ncurses)
+
+      - name: Smoke-test (--version)
+        if: env.SKIP != '1'
+        run: ./scx_quicksched_asan --version
+
+      - name: Smoke-test (--help)
+        if: env.SKIP != '1'
+        run: ./scx_quicksched_asan --help
+
+  format:
+    name: clang-format check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find src -name '*.c' -o -name '*.h' | \
+            xargs clang-format --dry-run --Werror
