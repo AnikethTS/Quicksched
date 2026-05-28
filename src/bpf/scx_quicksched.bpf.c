@@ -58,12 +58,11 @@ const volatile bool enable_cpuperf = true;
 const volatile __u32 batch_cpuperf_abs = 512; /* pre-scaled to 0-1024 by userspace */
 
 extern int scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
-extern void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id,
-                               u64 slice, u64 enq_flags) __ksym;
+extern void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym;
 extern bool scx_bpf_dsq_move_to_local(u64 dsq_id) __ksym;
 extern void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
-extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
-                                  u64 wake_flags, bool *is_idle) __ksym;
+extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
+                                  bool *is_idle) __ksym;
 extern u64 scx_bpf_now(void) __ksym;
 extern u32 scx_bpf_nr_cpu_ids(void) __ksym;
 extern void scx_bpf_cpuperf_set(s32 cpu, u32 perf) __ksym;
@@ -105,8 +104,7 @@ static __always_inline u32 log2_u64(u64 v)
     return r;
 }
 
-static __always_inline bool task_is_interactive(struct task_struct *p,
-                                                struct qs_task_ctx *tctx)
+static __always_inline bool task_is_interactive(struct task_struct *p, struct qs_task_ctx *tctx)
 {
     __u64 total;
     __s32 nice;
@@ -184,7 +182,8 @@ int BPF_PROG(scx_quicksched_runnable, struct task_struct *p, u64 enq_flags)
     {
         __u64 sleep_dur = scx_bpf_now() - tctx->sleep_at;
 
-        tctx->sum_sleep_ns = (tctx->sum_sleep_ns * QS_EWMA_WEIGHT + sleep_dur) / (QS_EWMA_WEIGHT + 1);
+        tctx->sum_sleep_ns =
+            (tctx->sum_sleep_ns * QS_EWMA_WEIGHT + sleep_dur) / (QS_EWMA_WEIGHT + 1);
         tctx->wakeups++;
         tctx->sleep_at = 0;
         tctx->enqueue_at = scx_bpf_now();
@@ -259,9 +258,7 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
     if (interactive)
     {
         slice = slice_interactive_ns;
-        dsq_id = (sel_cpu >= 0 && sel_cpu < QS_MAX_CPUS)
-                     ? (u64)sel_cpu
-                     : 0;
+        dsq_id = (sel_cpu >= 0 && sel_cpu < QS_MAX_CPUS) ? (u64)sel_cpu : 0;
 
         if (enq_flags & SCX_ENQ_WAKEUP)
         {
@@ -354,8 +351,7 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
 
     if (enable_cpuperf)
     {
-        bool mem_stall = tctx->wakeups >= QS_MIN_WAKEUPS &&
-                         tctx->slice_util_ewma < 40;
+        bool mem_stall = tctx->wakeups >= QS_MIN_WAKEUPS && tctx->slice_util_ewma < 40;
         u32 perf;
 
         if (task_is_interactive(p, tctx) && !mem_stall)
@@ -507,19 +503,19 @@ int BPF_PROG(scx_quicksched_exit, struct scx_exit_info *ei)
 
 SEC(".struct_ops")
 struct sched_ext_ops scx_quicksched_ops = {
-    .select_cpu  = (void *)scx_quicksched_select_cpu,
-    .enqueue     = (void *)scx_quicksched_enqueue,
-    .dispatch    = (void *)scx_quicksched_dispatch,
-    .runnable    = (void *)scx_quicksched_runnable,
-    .running     = (void *)scx_quicksched_running,
-    .stopping    = (void *)scx_quicksched_stopping,
-    .init_task   = (void *)scx_quicksched_init_task,
-    .exit_task   = (void *)scx_quicksched_exit_task,
-    .cpu_online  = (void *)scx_quicksched_cpu_online,
+    .select_cpu = (void *)scx_quicksched_select_cpu,
+    .enqueue = (void *)scx_quicksched_enqueue,
+    .dispatch = (void *)scx_quicksched_dispatch,
+    .runnable = (void *)scx_quicksched_runnable,
+    .running = (void *)scx_quicksched_running,
+    .stopping = (void *)scx_quicksched_stopping,
+    .init_task = (void *)scx_quicksched_init_task,
+    .exit_task = (void *)scx_quicksched_exit_task,
+    .cpu_online = (void *)scx_quicksched_cpu_online,
     .cpu_offline = (void *)scx_quicksched_cpu_offline,
-    .init        = (void *)scx_quicksched_init,
-    .exit        = (void *)scx_quicksched_exit,
-    .timeout_ms  = 30000,
-    .flags       = SCX_OPS_KEEP_BUILTIN_IDLE,
-    .name        = "scx_quicksched",
+    .init = (void *)scx_quicksched_init,
+    .exit = (void *)scx_quicksched_exit,
+    .timeout_ms = 30000,
+    .flags = SCX_OPS_KEEP_BUILTIN_IDLE,
+    .name = "scx_quicksched",
 };

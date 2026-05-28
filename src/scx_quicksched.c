@@ -19,8 +19,7 @@ static int verbose;
 static int no_tui;
 static uint64_t slo_us = 0;
 
-static int libbpf_print_fn(enum libbpf_print_level level,
-                           const char *fmt, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *fmt, va_list args)
 {
     if (level == LIBBPF_DEBUG && !verbose)
         return 0;
@@ -35,24 +34,23 @@ static void sig_handler(int sig)
 
 static void usage(const char *prog)
 {
-    printf(
-        "Usage: %s [OPTIONS]\n\n"
-        "Latency-optimized sched_ext scheduler. Requires root.\n"
-        "Developed by Aniketh T S\n\n"
-        "Options:\n"
-        "  -i, --interactive-slice-us N   interactive slice in us  (default: 5000)\n"
-        "  -b, --batch-slice-us N         batch slice in us         (default: 20000)\n"
-        "  -n, --nice-interactive-max N   nice threshold            (default: 0)\n"
-        "  -p, --interactive-sleep-pct N  min sleep %% for interactive (default: 50)\n"
-        "      --batch-cpuperf-pct N      batch CPU freq %%         (default: 50)\n"
-        "      --no-cpuperf               disable CPU freq scaling\n"
-        "      --no-tui                   plain text output\n"
-        "      --slo-us N                 alert when p99 latency exceeds N us (0=off)\n"
-        "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
-        "  -v, --verbose                  verbose libbpf output\n"
-        "  -V, --version                  print version and exit\n"
-        "  -h, --help\n",
-        prog);
+    printf("Usage: %s [OPTIONS]\n\n"
+           "Latency-optimized sched_ext scheduler. Requires root.\n"
+           "Developed by Aniketh T S\n\n"
+           "Options:\n"
+           "  -i, --interactive-slice-us N   interactive slice in us  (default: 5000)\n"
+           "  -b, --batch-slice-us N         batch slice in us         (default: 20000)\n"
+           "  -n, --nice-interactive-max N   nice threshold            (default: 0)\n"
+           "  -p, --interactive-sleep-pct N  min sleep %% for interactive (default: 50)\n"
+           "      --batch-cpuperf-pct N      batch CPU freq %%         (default: 50)\n"
+           "      --no-cpuperf               disable CPU freq scaling\n"
+           "      --no-tui                   plain text output\n"
+           "      --slo-us N                 alert when p99 latency exceeds N us (0=off)\n"
+           "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
+           "  -v, --verbose                  verbose libbpf output\n"
+           "  -V, --version                  print version and exit\n"
+           "  -h, --help\n",
+           prog);
 }
 
 static void read_percpu(struct bpf_map *map, void *out, size_t elem_sz)
@@ -163,39 +161,16 @@ static void draw_bar(int y, int x, int w, uint64_t val, uint64_t max, int cp)
 }
 
 static const char *lat_labels[QS_LAT_BUCKETS] = {
-    "   <1us",
-    "    1us",
-    "    2us",
-    "    4us",
-    "    8us",
-    "   16us",
-    "   32us",
-    "   64us",
-    "  128us",
-    "  256us",
-    "  512us",
-    "    1ms",
-    "    2ms",
-    "    4ms",
-    "    8ms",
-    "   16ms",
-    "   32ms",
-    "   64ms",
-    "  128ms",
-    "  256ms",
+    "   <1us", "    1us", "    2us", "    4us", "    8us", "   16us", "   32us",
+    "   64us", "  128us", "  256us", "  512us", "    1ms", "    2ms", "    4ms",
+    "    8ms", "   16ms", "   32ms", "   64ms", "  128ms", "  256ms",
 };
 
-static void tui_draw(
-    uint64_t interactive_slice_us, uint64_t batch_slice_us,
-    int32_t nice_max, uint32_t sleep_pct,
-    int cpuperf_off,
-    uint64_t d_int, uint64_t d_batch, uint64_t d_local,
-    uint64_t d_preempted, uint64_t d_memalloc,
-    uint64_t d_count, uint64_t avg_us, uint64_t p50, uint64_t p99,
-    uint64_t *d_buckets,
-    uint64_t uptime_s,
-    uint64_t slo_alert_us,
-    uint64_t *d_cpu, int ncpus)
+static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int32_t nice_max,
+                     uint32_t sleep_pct, int cpuperf_off, uint64_t d_int, uint64_t d_batch,
+                     uint64_t d_local, uint64_t d_preempted, uint64_t d_memalloc, uint64_t d_count,
+                     uint64_t avg_us, uint64_t p50, uint64_t p99, uint64_t *d_buckets,
+                     uint64_t uptime_s, uint64_t slo_alert_us, uint64_t *d_cpu, int ncpus)
 {
     int rows, cols;
     char uts[32];
@@ -222,10 +197,8 @@ static void tui_draw(
     mvprintw(0, 15, "by Aniketh T S");
     attroff(COLOR_PAIR(CP_DIM));
 
-    snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ",
-             (unsigned long long)(uptime_s / 3600),
-             (unsigned long long)((uptime_s % 3600) / 60),
-             (unsigned long long)(uptime_s % 60));
+    snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ", (unsigned long long)(uptime_s / 3600),
+             (unsigned long long)((uptime_s % 3600) / 60), (unsigned long long)(uptime_s % 60));
     mvprintw(0, cols - (int)strlen(uts) - 1, "%s", uts);
 
     row = 1;
@@ -241,10 +214,8 @@ static void tui_draw(
     attron(COLOR_PAIR(CP_DIM));
     mvprintw(row++, 2,
              "slices: interactive=%lluus  batch=%lluus  nice<=%d  sleep>=%u%%  cpuperf: %s",
-             (unsigned long long)interactive_slice_us,
-             (unsigned long long)batch_slice_us,
-             nice_max, sleep_pct,
-             cpuperf_off ? "off" : "on");
+             (unsigned long long)interactive_slice_us, (unsigned long long)batch_slice_us, nice_max,
+             sleep_pct, cpuperf_off ? "off" : "on");
     attroff(COLOR_PAIR(CP_DIM));
 
     row++;
@@ -275,8 +246,8 @@ static void tui_draw(
         mvprintw(row, 2, "%s", srows[i].label);
         attroff(COLOR_PAIR(srows[i].cp));
         draw_bar(row, 16, bar_w, srows[i].val, tot > 0 ? tot : 1, srows[i].cp);
-        mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%",
-                 (unsigned long long)srows[i].val, (unsigned long long)pct);
+        mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%", (unsigned long long)srows[i].val,
+                 (unsigned long long)pct);
         row++;
     }
 
@@ -310,8 +281,7 @@ static void tui_draw(
             mvprintw(row, 2, "%s", mrows[i].label);
             attroff(COLOR_PAIR(mrows[i].cp));
             draw_bar(row, 16, bar_w, mrows[i].val, mem_scale, mrows[i].cp);
-            mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%",
-                     (unsigned long long)mrows[i].val,
+            mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%", (unsigned long long)mrows[i].val,
                      (unsigned long long)pct);
             row++;
         }
@@ -333,7 +303,8 @@ static void tui_draw(
     {
         /* Two CPU entries per row; each cell: "  CPUxxx [BBBBBBBB] nnnnn" */
         int cpu_bar_w = (cols - 8) / 2 - 18;
-        if (cpu_bar_w < 4) cpu_bar_w = 4;
+        if (cpu_bar_w < 4)
+            cpu_bar_w = 4;
 
         uint64_t cpu_max = 1;
         for (int ci = 0; ci < ncpus; ci++)
@@ -381,9 +352,7 @@ static void tui_draw(
         {
             attron(COLOR_PAIR(CP_DIM));
             mvprintw(row++, 4, "avg=%lluus  p50=%lluus  p99=%lluus  n=%llu",
-                     (unsigned long long)avg_us,
-                     (unsigned long long)p50,
-                     (unsigned long long)p99,
+                     (unsigned long long)avg_us, (unsigned long long)p50, (unsigned long long)p99,
                      (unsigned long long)d_count);
             attroff(COLOR_PAIR(CP_DIM));
         }
@@ -432,20 +401,19 @@ int main(int argc, char **argv)
     int no_cpuperf = 0;
     uint32_t stats_interval = 1;
 
-    static const struct option long_opts[] = {
-        {"interactive-slice-us", required_argument, 0, 'i'},
-        {"batch-slice-us", required_argument, 0, 'b'},
-        {"nice-interactive-max", required_argument, 0, 'n'},
-        {"interactive-sleep-pct", required_argument, 0, 'p'},
-        {"batch-cpuperf-pct", required_argument, 0, 1},
-        {"no-cpuperf", no_argument, 0, 2},
-        {"no-tui", no_argument, 0, 3},
-        {"slo-us", required_argument, 0, 4},
-        {"stats-interval", required_argument, 0, 's'},
-        {"verbose", no_argument, 0, 'v'},
-        {"version", no_argument, 0, 'V'},
-        {"help", no_argument, 0, 'h'},
-        {0}};
+    static const struct option long_opts[] = {{"interactive-slice-us", required_argument, 0, 'i'},
+                                              {"batch-slice-us", required_argument, 0, 'b'},
+                                              {"nice-interactive-max", required_argument, 0, 'n'},
+                                              {"interactive-sleep-pct", required_argument, 0, 'p'},
+                                              {"batch-cpuperf-pct", required_argument, 0, 1},
+                                              {"no-cpuperf", no_argument, 0, 2},
+                                              {"no-tui", no_argument, 0, 3},
+                                              {"slo-us", required_argument, 0, 4},
+                                              {"stats-interval", required_argument, 0, 's'},
+                                              {"verbose", no_argument, 0, 'v'},
+                                              {"version", no_argument, 0, 'V'},
+                                              {"help", no_argument, 0, 'h'},
+                                              {0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "i:b:n:p:s:vVh", long_opts, NULL)) != -1)
@@ -549,10 +517,9 @@ int main(int argc, char **argv)
     {
         printf("scx_quicksched (Quicksched) — developed by Aniketh T S\n");
         printf("  slices: interactive=%lluus batch=%lluus\n",
-               (unsigned long long)interactive_slice_us,
-               (unsigned long long)batch_slice_us);
-        printf("  interactive: nice <= %d or sleep >= %u%%\n",
-               nice_interactive_max, interactive_sleep_pct);
+               (unsigned long long)interactive_slice_us, (unsigned long long)batch_slice_us);
+        printf("  interactive: nice <= %d or sleep >= %u%%\n", nice_interactive_max,
+               interactive_sleep_pct);
         if (!no_cpuperf)
             printf("  cpuperf: interactive=100%% batch=%u%%\n", batch_cpuperf_pct);
     }
@@ -562,7 +529,7 @@ int main(int argc, char **argv)
         ncpus = 1;
 
     struct qs_cpu_load *prev_cpu_loads = calloc(ncpus, sizeof(*prev_cpu_loads));
-    struct qs_cpu_load *cur_cpu_loads  = calloc(ncpus, sizeof(*cur_cpu_loads));
+    struct qs_cpu_load *cur_cpu_loads = calloc(ncpus, sizeof(*cur_cpu_loads));
     uint64_t *d_cpu = calloc(ncpus, sizeof(*d_cpu));
     if (!prev_cpu_loads || !cur_cpu_loads || !d_cpu)
     {
@@ -583,11 +550,8 @@ int main(int argc, char **argv)
     if (!no_tui)
     {
         uint64_t zero[QS_LAT_BUCKETS] = {};
-        tui_draw(interactive_slice_us, batch_slice_us,
-                 nice_interactive_max, interactive_sleep_pct,
-                 no_cpuperf,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0,
-                 slo_us, NULL, 0);
+        tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max, interactive_sleep_pct,
+                 no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0);
     }
 
     while (!stop)
@@ -604,8 +568,7 @@ int main(int argc, char **argv)
 
         read_percpu(skel->maps.stats, &cur_stats, sizeof(cur_stats));
         read_percpu(skel->maps.latency, &cur_lat, sizeof(cur_lat));
-        read_percpu_array(skel->maps.cpu_load, cur_cpu_loads,
-                          sizeof(*cur_cpu_loads), ncpus);
+        read_percpu_array(skel->maps.cpu_load, cur_cpu_loads, sizeof(*cur_cpu_loads), ncpus);
         for (int i = 0; i < ncpus; i++)
             d_cpu[i] = cur_cpu_loads[i].nr_dispatch >= prev_cpu_loads[i].nr_dispatch
                            ? cur_cpu_loads[i].nr_dispatch - prev_cpu_loads[i].nr_dispatch
@@ -628,12 +591,9 @@ int main(int argc, char **argv)
                                   ? cur_stats.nr_memalloc - prev_stats.nr_memalloc
                                   : 0;
 
-        uint64_t d_count = cur_lat.count >= prev_lat.count
-                               ? cur_lat.count - prev_lat.count
-                               : 0;
-        uint64_t d_total_ns = cur_lat.total_ns >= prev_lat.total_ns
-                                  ? cur_lat.total_ns - prev_lat.total_ns
-                                  : 0;
+        uint64_t d_count = cur_lat.count >= prev_lat.count ? cur_lat.count - prev_lat.count : 0;
+        uint64_t d_total_ns =
+            cur_lat.total_ns >= prev_lat.total_ns ? cur_lat.total_ns - prev_lat.total_ns : 0;
         uint64_t d_buckets[QS_LAT_BUCKETS];
         for (int i = 0; i < QS_LAT_BUCKETS; i++)
             d_buckets[i] = cur_lat.buckets[i] >= prev_lat.buckets[i]
@@ -647,33 +607,25 @@ int main(int argc, char **argv)
         if (!no_tui)
         {
             uint64_t uptime_s = (uint64_t)(time(NULL) - start_time);
-            tui_draw(interactive_slice_us, batch_slice_us,
-                     nice_interactive_max, interactive_sleep_pct,
-                     no_cpuperf,
-                     d_int, d_batch, d_local,
-                     d_preempted, d_memalloc,
-                     d_count, avg_us, p50, p99, d_buckets,
-                     uptime_s, slo_us, d_cpu, ncpus);
+            tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max,
+                     interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
+                     d_memalloc, d_count, avg_us, p50, p99, d_buckets, uptime_s, slo_us, d_cpu,
+                     ncpus);
         }
         else
         {
             uint64_t total = d_int + d_batch + d_local;
             if (total > 0)
                 printf("interactive=%6llu  batch=%6llu  idle-fast=%6llu  (%llu%% interactive)\n",
-                       (unsigned long long)d_int,
-                       (unsigned long long)d_batch,
-                       (unsigned long long)d_local,
-                       (unsigned long long)(d_int * 100 / total));
+                       (unsigned long long)d_int, (unsigned long long)d_batch,
+                       (unsigned long long)d_local, (unsigned long long)(d_int * 100 / total));
             if (d_preempted > 0 || d_memalloc > 0)
                 printf("memory:  preempted=%llu  memalloc-demoted=%llu\n",
-                       (unsigned long long)d_preempted,
-                       (unsigned long long)d_memalloc);
+                       (unsigned long long)d_preempted, (unsigned long long)d_memalloc);
             if (d_count > 0)
             {
                 printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",
-                       (unsigned long long)avg_us,
-                       (unsigned long long)p50,
-                       (unsigned long long)p99,
+                       (unsigned long long)avg_us, (unsigned long long)p50, (unsigned long long)p99,
                        (unsigned long long)d_count);
                 if (slo_us > 0 && p99 > slo_us)
                     printf("!! LATENCY SLO BREACH: p99=%lluus > %lluus !!\n",
