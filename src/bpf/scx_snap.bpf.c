@@ -168,6 +168,7 @@ s32 BPF_PROG(scx_snap_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_
             __u32 zero = 0;
             struct snap_stats *st;
 
+            tctx->assigned_slice_ns = slice;
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 
             st = bpf_map_lookup_elem(&stats, &zero);
@@ -189,6 +190,15 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
     __u64 dsq_id;
     __u32 zero = 0;
     s32 sel_cpu;
+
+    if (p->flags & PF_MEMALLOC)
+    {
+        scx_bpf_dsq_insert(p, SNAP_DSQ_BATCH, slice_batch_ns, enq_flags);
+        st = bpf_map_lookup_elem(&stats, &zero);
+        if (st)
+            st->nr_memalloc++;
+        return 0;
+    }
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
@@ -219,6 +229,7 @@ int BPF_PROG(scx_snap_enqueue, struct task_struct *p, u64 enq_flags)
         dsq_id = SNAP_DSQ_BATCH;
     }
 
+    tctx->assigned_slice_ns = slice;
     scx_bpf_dsq_insert(p, dsq_id, slice, dsq_flags);
 
     st = bpf_map_lookup_elem(&stats, &zero);
@@ -257,7 +268,10 @@ int BPF_PROG(scx_snap_running, struct task_struct *p)
 
     if (enable_cpuperf)
     {
-        u32 perf = task_is_interactive(p, tctx) ? 1024 : batch_cpuperf_abs;
+        /* Memory-stall-bound tasks gain nothing from higher CPU frequency. */
+        bool mem_stall = tctx->wakeups >= SNAP_MIN_WAKEUPS &&
+                         tctx->slice_util_ewma < 40;
+        u32 perf = (task_is_interactive(p, tctx) && !mem_stall) ? 1024 : batch_cpuperf_abs;
         scx_bpf_cpuperf_set(cpu, perf);
     }
 
@@ -283,6 +297,24 @@ int BPF_PROG(scx_snap_stopping, struct task_struct *p, bool runnable)
 
         tctx->sum_run_ns = (tctx->sum_run_ns * SNAP_EWMA_WEIGHT + run_dur) / (SNAP_EWMA_WEIGHT + 1);
         tctx->run_at = 0;
+
+        if (tctx->assigned_slice_ns > 0)
+        {
+            __u64 util = run_dur * 100 / tctx->assigned_slice_ns;
+            if (util > 100)
+                util = 100;
+            tctx->slice_util_ewma =
+                (tctx->slice_util_ewma * SNAP_EWMA_WEIGHT + util) / (SNAP_EWMA_WEIGHT + 1);
+
+            /* Stayed runnable but used <90% of slice → preempted or stalled. */
+            if (runnable && util < 90)
+            {
+                __u32 zero = 0;
+                struct snap_stats *st = bpf_map_lookup_elem(&stats, &zero);
+                if (st)
+                    st->nr_preempted++;
+            }
+        }
     }
 
     if (!runnable)
@@ -304,6 +336,8 @@ s32 BPF_PROG(scx_snap_init_task, struct task_struct *p, struct scx_init_task_arg
     tctx->run_at = 0;
     tctx->sleep_at = 0;
     tctx->enqueue_at = 0;
+    tctx->assigned_slice_ns = 0;
+    tctx->slice_util_ewma = 100; /* assume CPU-bound until we observe otherwise */
     tctx->wakeups = 0;
 
     return 0;

@@ -151,6 +151,7 @@ static void tui_draw(
     int32_t nice_max, uint32_t sleep_pct,
     int cpuperf_off,
     uint64_t d_int, uint64_t d_batch, uint64_t d_local,
+    uint64_t d_preempted, uint64_t d_memalloc,
     uint64_t d_count, uint64_t avg_us, uint64_t p50, uint64_t p99,
     uint64_t *d_buckets,
     uint64_t uptime_s)
@@ -219,6 +220,38 @@ static void tui_draw(
         mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%",
                  (unsigned long long)srows[i].val, (unsigned long long)pct);
         row++;
+    }
+
+    row++;
+
+    if (row >= rows - 1)
+    {
+        refresh();
+        return;
+    }
+
+    attron(A_BOLD);
+    mvprintw(row++, 2, "MEMORY");
+    attroff(A_BOLD);
+
+    {
+        struct { const char *label; uint64_t val; int cp; } mrows[] = {
+            { "  memalloc  ", d_memalloc,  CP_BATCH },
+            { "  preempted ", d_preempted, CP_LAT   },
+        };
+        uint64_t mem_scale = tot > 0 ? tot : 1;
+        for (i = 0; i < 2 && row < rows - 1; i++)
+        {
+            uint64_t pct = mrows[i].val * 100 / mem_scale;
+            attron(COLOR_PAIR(mrows[i].cp));
+            mvprintw(row, 2, "%s", mrows[i].label);
+            attroff(COLOR_PAIR(mrows[i].cp));
+            draw_bar(row, 16, bar_w, mrows[i].val, mem_scale, mrows[i].cp);
+            mvprintw(row, 16 + bar_w + 1, "%7llu  %3llu%%",
+                     (unsigned long long)mrows[i].val,
+                     (unsigned long long)pct);
+            row++;
+        }
     }
 
     row++;
@@ -406,7 +439,7 @@ int main(int argc, char **argv)
         tui_draw(interactive_slice_us, batch_slice_us,
                  nice_interactive_max, interactive_sleep_pct,
                  no_cpuperf,
-                 0, 0, 0, 0, 0, 0, 0, zero, 0);
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0);
     }
 
     while (!stop)
@@ -434,6 +467,13 @@ int main(int argc, char **argv)
                                ? cur_stats.nr_local - prev_stats.nr_local
                                : 0;
 
+        uint64_t d_preempted = cur_stats.nr_preempted >= prev_stats.nr_preempted
+                                   ? cur_stats.nr_preempted - prev_stats.nr_preempted
+                                   : 0;
+        uint64_t d_memalloc = cur_stats.nr_memalloc >= prev_stats.nr_memalloc
+                                  ? cur_stats.nr_memalloc - prev_stats.nr_memalloc
+                                  : 0;
+
         uint64_t d_count = cur_lat.count >= prev_lat.count
                                ? cur_lat.count - prev_lat.count
                                : 0;
@@ -457,6 +497,7 @@ int main(int argc, char **argv)
                      nice_interactive_max, interactive_sleep_pct,
                      no_cpuperf,
                      d_int, d_batch, d_local,
+                     d_preempted, d_memalloc,
                      d_count, avg_us, p50, p99, d_buckets,
                      uptime_s);
         }
@@ -469,6 +510,10 @@ int main(int argc, char **argv)
                        (unsigned long long)d_batch,
                        (unsigned long long)d_local,
                        (unsigned long long)(d_int * 100 / total));
+            if (d_preempted > 0 || d_memalloc > 0)
+                printf("memory:  preempted=%llu  memalloc-demoted=%llu\n",
+                       (unsigned long long)d_preempted,
+                       (unsigned long long)d_memalloc);
             if (d_count > 0)
                 printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",
                        (unsigned long long)avg_us,
