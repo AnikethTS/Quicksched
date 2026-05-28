@@ -1,12 +1,13 @@
-.TH SCX_SNAP 1 "2026-05-28" "Quicksched" "User Commands"
+.TH SCX_QUICKSCHED 1 "2026-05-28" "Quicksched" "User Commands"
 .SH NAME
-scx_snap \- latency-optimised sched_ext CPU scheduler
+scx_quicksched \- latency-optimised sched_ext CPU scheduler
 .SH SYNOPSIS
-.B scx_snap
+.B scx_quicksched
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
-\fBscx_snap\fR is a BPF-based CPU scheduler that replaces the kernel's
-default CFS scheduler using the \fIsched_ext\fR framework (kernel \(>= 6.12).
+\fBscx_quicksched\fR (Quicksched) is a BPF-based CPU scheduler that replaces
+the kernel's default CFS scheduler using the \fIsched_ext\fR framework
+(kernel \(>= 6.12).
 .PP
 Tasks are classified as \fIinteractive\fR or \fIbatch\fR based on their nice
 value and historical sleep ratio.  Interactive tasks receive a short time slice
@@ -43,9 +44,15 @@ Disable CPU frequency scaling entirely.
 Plain text output instead of the ncurses TUI.  Useful for running under
 systemd or in scripts.
 .TP
+.B \-\-slo\-us " " \fIN\fR
+Alert when p99 wakeup latency exceeds \fIN\fR microseconds (default: 0 = off).
+.TP
 .BR \-s ", " \-\-stats\-interval " " \fIN\fR
 Stats reporting interval in seconds (default: \fB1\fR).  Set to 0 to disable
 stats output while still running the scheduler.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
 .TP
 .BR \-v ", " \-\-verbose
 Enable verbose libbpf diagnostic output.
@@ -79,13 +86,13 @@ Kernel@Status
 sched_ext control directory.  Present only when the running kernel was built
 with \fBCONFIG_SCHED_CLASS_EXT=y\fR.
 .TP
-.I /lib/systemd/system/scx_snap.service
+.I /lib/systemd/system/scx_quicksched.service
 systemd unit installed by \fBmake install\fR.
 .SH EXAMPLES
 Run with the interactive TUI:
 .RS
 .nf
-sudo scx_snap
+sudo scx_quicksched
 .fi
 .RE
 .PP
@@ -93,19 +100,19 @@ Run as a systemd service:
 .RS
 .nf
 sudo make install
-sudo systemctl enable --now scx_snap
+sudo systemctl enable --now scx_quicksched
 .fi
 .RE
 .PP
 Tune for an audio workstation (2 ms interactive slice, batch at 25% freq):
 .RS
 .nf
-sudo scx_snap \-i 2000 \-\-batch\-cpuperf\-pct 25
+sudo scx_quicksched \-i 2000 \-\-batch\-cpuperf\-pct 25
 .fi
 .RE
 .SH SAFETY
-When the \fBscx_snap\fR process exits or is killed, the BPF struct_ops link
-is released and the kernel automatically reverts all tasks to CFS.  The
+When the \fBscx_quicksched\fR process exits or is killed, the BPF struct_ops
+link is released and the kernel automatically reverts all tasks to CFS.  The
 scheduler also sets \fBtimeout_ms\fR in the ops struct so that the kernel will
 self-revert if any task fails to make progress for more than 30 seconds.
 .SH SEE ALSO
