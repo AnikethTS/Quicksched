@@ -21,10 +21,32 @@ KVER := $(shell uname -r)
 CFLAGS    := -O2 -g -Wall -Wextra
 BPF_FLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -fno-stack-protector
 
-# Resolve library flags via pkg-config so the build works on all distros
-# (Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE) without hardcoded paths.
-LIBBPF_CFLAGS  := $(shell pkg-config --cflags libbpf  2>/dev/null)
-LIBBPF_LDFLAGS := $(shell pkg-config --libs   libbpf  2>/dev/null || echo "-lbpf")
+# bpftool (from linux-tools) bundles libbpf 1.7 which generates skeletons with
+# a 32-byte bpf_map_skeleton stride (4 fields, including link).  Ubuntu 24.04
+# ships libbpf 1.3.0 whose binary still uses the old 24-byte stride, causing a
+# segfault when the skeleton is opened.  Prefer the kernel-bundled libbpf.a
+# (same version as bpftool) when the system copy is older than 1.4.
+KLIBBPF_DIR := /usr/src/linux-headers-$(KVER)/tools/bpf/resolve_btfids/libbpf
+
+# Version check: "yes" if system libbpf >= 1.4, else "no"
+LIBBPF_VERSION_OK := $(shell \
+  pkg-config --modversion libbpf 2>/dev/null | \
+  awk -F. '{ok=($$1>1)||($$1==1&&$$2>=4); print (ok?"yes":"no")}')
+
+ifeq ($(LIBBPF_VERSION_OK),yes)
+  LIBBPF_CFLAGS  := $(shell pkg-config --cflags libbpf  2>/dev/null)
+  LIBBPF_LDFLAGS := $(shell pkg-config --libs   libbpf  2>/dev/null || echo "-lbpf")
+else ifneq ($(wildcard $(KLIBBPF_DIR)/libbpf.a),)
+  LIBBPF_CFLAGS  := -I$(KLIBBPF_DIR)/include
+  LIBBPF_LDFLAGS := $(KLIBBPF_DIR)/libbpf.a -lelf -lz -lzstd
+else
+  # System libbpf too old, no fallback available — proceed and warn at link time
+  LIBBPF_CFLAGS  := $(shell pkg-config --cflags libbpf  2>/dev/null)
+  LIBBPF_LDFLAGS := $(shell pkg-config --libs   libbpf  2>/dev/null || echo "-lbpf")
+  $(warning System libbpf < 1.4 detected and no kernel-bundled fallback found.)
+  $(warning Install linux-headers-$(KVER) or upgrade libbpf to fix a segfault on load.)
+endif
+
 NCURSES_CFLAGS  := $(shell pkg-config --cflags ncurses 2>/dev/null)
 NCURSES_LDFLAGS := $(shell pkg-config --libs   ncurses 2>/dev/null || echo "-lncurses")
 
@@ -74,6 +96,7 @@ $(SKEL_H): $(BPF_OBJ) | $(BUILDDIR)
 
 $(TARGET): src/scx_quicksched.c src/bpf/scx_quicksched.h $(SKEL_H)
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(NCURSES_CFLAGS) \
+		-D_DEFAULT_SOURCE -D_XOPEN_SOURCE=600 \
 		-I$(BUILDDIR) -Isrc/bpf $< \
 		$(LIBBPF_LDFLAGS) $(NCURSES_LDFLAGS) -o $@
 
