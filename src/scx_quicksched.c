@@ -193,10 +193,6 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     mvprintw(0, 2, " Quicksched ");
     attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
 
-    attron(COLOR_PAIR(CP_DIM));
-    mvprintw(0, 15, "by Aniketh T S");
-    attroff(COLOR_PAIR(CP_DIM));
-
     snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ", (unsigned long long)(uptime_s / 3600),
              (unsigned long long)((uptime_s % 3600) / 60), (unsigned long long)(uptime_s % 60));
     mvprintw(0, cols - (int)strlen(uts) - 1, "%s", uts);
