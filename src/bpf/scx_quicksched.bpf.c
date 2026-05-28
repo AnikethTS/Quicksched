@@ -58,6 +58,14 @@ struct
     __type(value, struct qs_dynamic_cfg);
 } dynamic_cfg SEC(".maps");
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qs_exit_info);
+} exit_info SEC(".maps");
+
 const volatile __u64 slice_interactive_ns = QS_SLICE_INTERACTIVE_NS;
 const volatile __u64 slice_batch_ns = QS_SLICE_BATCH_NS;
 const volatile __s32 nice_interactive_max = 0;
@@ -303,23 +311,30 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
     u32 nr_cpus = scx_bpf_nr_cpu_ids();
     __u32 zero = 0;
     struct qs_cpu_load *cl;
+    __u32 is_interactive = 0;
 
     /* Own interactive DSQ */
     if (cpu >= 0 && (u32)cpu < nr_cpus && scx_bpf_dsq_move_to_local((u64)cpu))
+    {
+        is_interactive = 1;
         goto dispatched;
+    }
 
-    /* Work-steal from up to 8 neighbouring CPUs' interactive DSQs.
-     * This also drains interactive queues of CPUs going offline. */
+    /* Work-steal: use a stride to cover the whole machine evenly, not just
+     * 8 sequential neighbours.  On a 64-core box the stride is 4, so we
+     * sample every 4th CPU — far side of NUMA included. */
     if (cpu >= 0)
     {
-        for (u32 i = 1; i <= 8; i++)
+        u32 stride = nr_cpus > QS_MAX_STEAL_CPUS ? nr_cpus / QS_MAX_STEAL_CPUS : 1;
+        for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
         {
-            u32 steal = ((u32)cpu + i) % nr_cpus;
+            u32 steal = ((u32)cpu + i * stride) % nr_cpus;
             if (scx_bpf_dsq_move_to_local((u64)steal))
             {
                 struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
                 if (st)
                     st->nr_stolen++;
+                is_interactive = 1;
                 goto dispatched;
             }
         }
@@ -339,7 +354,13 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
 dispatched:
     cl = bpf_map_lookup_elem(&cpu_load, &zero);
     if (cl)
+    {
         cl->nr_dispatch++;
+        if (is_interactive)
+            cl->nr_interactive++;
+        else
+            cl->nr_batch++;
+    }
     return 0;
 }
 
@@ -519,6 +540,15 @@ s32 scx_quicksched_init(void)
 SEC("struct_ops/scx_quicksched_exit")
 int BPF_PROG(scx_quicksched_exit, struct scx_exit_info *ei)
 {
+    __u32 zero = 0;
+    struct qs_exit_info *xi = bpf_map_lookup_elem(&exit_info, &zero);
+
+    if (xi)
+    {
+        xi->kind = BPF_CORE_READ(ei, kind);
+        bpf_probe_read_kernel_str(xi->reason, sizeof(xi->reason), BPF_CORE_READ(ei, reason));
+        bpf_probe_read_kernel_str(xi->msg, sizeof(xi->msg), BPF_CORE_READ(ei, msg));
+    }
     return 0;
 }
 

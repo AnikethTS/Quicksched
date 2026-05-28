@@ -44,6 +44,15 @@ Disable CPU frequency scaling entirely.
 Plain text output instead of the ncurses TUI.  Useful for running under
 systemd or in scripts.
 .TP
+.B \-\-dry\-run
+Load and verify the BPF object, then exit without attaching the scheduler.
+Useful for checking kernel compatibility without replacing the running scheduler.
+.TP
+.B \-\-mem\-pressure\-pct " " \fIN\fR
+When PSI memory pressure \fIsome avg10\fR exceeds \fIN\fR percent, halve the
+batch CPU frequency cap until pressure subsides (default: 0 = off).
+Requires \fI/proc/pressure/memory\fR (Linux 4.20+).
+.TP
 .B \-\-slo\-us " " \fIN\fR
 Alert when p99 wakeup latency exceeds \fIN\fR microseconds (default: 0 = off).
 .TP
