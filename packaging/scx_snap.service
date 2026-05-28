@@ -1,0 +1,23 @@
+[Unit]
+Description=scx_snap — latency-optimised sched_ext CPU scheduler
+Documentation=man:scx_snap(1)
+After=multi-user.target
+# Only start if the kernel exposes the sched_ext control directory.
+ConditionPathExists=/sys/kernel/sched_ext
+ConditionCapability=CAP_SYS_ADMIN
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/scx_snap --no-tui
+# Restart on crash; give the kernel a moment to revert to CFS between restarts.
+Restart=on-failure
+RestartSec=5s
+# Send SIGTERM so the process can detach the BPF link cleanly before the
+# kernel reverts to CFS.  The kernel also reverts automatically when the
+# link fd is closed, so this is belt-and-suspenders.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
