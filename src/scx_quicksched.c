@@ -11,12 +11,13 @@
 #include <time.h>
 #include <ncurses.h>
 #include <bpf/libbpf.h>
-#include "scx_snap.h"
-#include "scx_snap.skel.h"
+#include "scx_quicksched.h"
+#include "scx_quicksched.skel.h"
 
 static volatile int stop;
 static int verbose;
 static int no_tui;
+static uint64_t slo_us = 0;
 
 static int libbpf_print_fn(enum libbpf_print_level level,
                            const char *fmt, va_list args)
@@ -46,8 +47,10 @@ static void usage(const char *prog)
         "      --batch-cpuperf-pct N      batch CPU freq %%         (default: 50)\n"
         "      --no-cpuperf               disable CPU freq scaling\n"
         "      --no-tui                   plain text output\n"
+        "      --slo-us N                 alert when p99 latency exceeds N us (0=off)\n"
         "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
         "  -v, --verbose                  verbose libbpf output\n"
+        "  -V, --version                  print version and exit\n"
         "  -h, --help\n",
         prog);
 }
@@ -78,23 +81,40 @@ out:
     free(buf);
 }
 
+static void read_percpu_array(struct bpf_map *map, void *out, size_t elem_sz, int ncpus)
+{
+    size_t stride = (elem_sz + 7) & ~(size_t)7;
+    uint8_t *buf = calloc(ncpus, stride);
+    if (!buf)
+        return;
+
+    uint32_t key = 0;
+    if (bpf_map__lookup_elem(map, &key, sizeof(key), buf, stride * ncpus, 0))
+        goto out;
+
+    for (int i = 0; i < ncpus; i++)
+        memcpy((uint8_t *)out + i * elem_sz, buf + i * stride, elem_sz);
+out:
+    free(buf);
+}
+
 static uint64_t lat_percentile(uint64_t *buckets, int pct)
 {
     uint64_t total = 0;
-    for (int i = 0; i < SNAP_LAT_BUCKETS; i++)
+    for (int i = 0; i < QS_LAT_BUCKETS; i++)
         total += buckets[i];
     if (!total)
         return 0;
 
     uint64_t target = ((uint64_t)pct * total + 99) / 100;
     uint64_t acc = 0;
-    for (int i = 0; i < SNAP_LAT_BUCKETS; i++)
+    for (int i = 0; i < QS_LAT_BUCKETS; i++)
     {
         acc += buckets[i];
         if (acc >= target)
             return i == 0 ? 0 : 3 * (1ULL << (i - 1)) / 2;
     }
-    return 1ULL << (SNAP_LAT_BUCKETS - 1);
+    return 1ULL << (QS_LAT_BUCKETS - 1);
 }
 
 #define CP_HEADER 1
@@ -103,6 +123,7 @@ static uint64_t lat_percentile(uint64_t *buckets, int pct)
 #define CP_IDLE 4
 #define CP_LAT 5
 #define CP_DIM 6
+#define CP_WARN 7
 
 static void tui_init(void)
 {
@@ -122,6 +143,7 @@ static void tui_init(void)
         init_pair(CP_IDLE, COLOR_BLUE, -1);
         init_pair(CP_LAT, COLOR_MAGENTA, -1);
         init_pair(CP_DIM, COLOR_WHITE, -1);
+        init_pair(CP_WARN, COLOR_RED, -1);
     }
 }
 
@@ -140,7 +162,7 @@ static void draw_bar(int y, int x, int w, uint64_t val, uint64_t max, int cp)
         mvaddch(y, x + i, ' ');
 }
 
-static const char *lat_labels[SNAP_LAT_BUCKETS] = {
+static const char *lat_labels[QS_LAT_BUCKETS] = {
     "   <1us",
     "    1us",
     "    2us",
@@ -171,7 +193,9 @@ static void tui_draw(
     uint64_t d_preempted, uint64_t d_memalloc,
     uint64_t d_count, uint64_t avg_us, uint64_t p50, uint64_t p99,
     uint64_t *d_buckets,
-    uint64_t uptime_s)
+    uint64_t uptime_s,
+    uint64_t slo_alert_us,
+    uint64_t *d_cpu, int ncpus)
 {
     int rows, cols;
     char uts[32];
@@ -191,11 +215,11 @@ static void tui_draw(
     box(stdscr, 0, 0);
 
     attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
-    mvprintw(0, 2, " scx_snap ");
+    mvprintw(0, 2, " Quicksched ");
     attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
 
     attron(COLOR_PAIR(CP_DIM));
-    mvprintw(0, 13, "by Aniketh T S");
+    mvprintw(0, 15, "by Aniketh T S");
     attroff(COLOR_PAIR(CP_DIM));
 
     snprintf(uts, sizeof(uts), " %02llu:%02llu:%02llu ",
@@ -205,6 +229,14 @@ static void tui_draw(
     mvprintw(0, cols - (int)strlen(uts) - 1, "%s", uts);
 
     row = 1;
+
+    if (slo_alert_us > 0 && p99 > slo_alert_us && row < rows - 1)
+    {
+        attron(COLOR_PAIR(CP_WARN) | A_BOLD);
+        mvprintw(row++, 2, "  !! LATENCY SLO BREACH: p99=%lluus > %lluus !!  ",
+                 (unsigned long long)p99, (unsigned long long)slo_alert_us);
+        attroff(COLOR_PAIR(CP_WARN) | A_BOLD);
+    }
 
     attron(COLOR_PAIR(CP_DIM));
     mvprintw(row++, 2,
@@ -294,6 +326,52 @@ static void tui_draw(
     }
 
     attron(A_BOLD);
+    mvprintw(row++, 2, "CPU LOAD  (dispatch/s)");
+    attroff(A_BOLD);
+
+    if (ncpus > 0 && d_cpu != NULL)
+    {
+        /* Two CPU entries per row; each cell: "  CPUxxx [BBBBBBBB] nnnnn" */
+        int cpu_bar_w = (cols - 8) / 2 - 18;
+        if (cpu_bar_w < 4) cpu_bar_w = 4;
+
+        uint64_t cpu_max = 1;
+        for (int ci = 0; ci < ncpus; ci++)
+            if (d_cpu[ci] > cpu_max)
+                cpu_max = d_cpu[ci];
+
+        int cell_w = (cols - 4) / 2;
+        int col_idx = 0;
+        for (int ci = 0; ci < ncpus && row < rows - 1; ci++)
+        {
+            int x = 2 + col_idx * cell_w;
+            uint64_t pct = d_cpu[ci] * 100 / cpu_max;
+            attron(COLOR_PAIR(CP_DIM));
+            mvprintw(row, x, "CPU%3d", ci);
+            attroff(COLOR_PAIR(CP_DIM));
+            draw_bar(row, x + 6, cpu_bar_w, d_cpu[ci], cpu_max,
+                     pct > 75 ? CP_IACTIVE : (pct > 30 ? CP_BATCH : CP_IDLE));
+            mvprintw(row, x + 6 + cpu_bar_w + 1, "%5llu", (unsigned long long)d_cpu[ci]);
+            col_idx++;
+            if (col_idx >= 2)
+            {
+                col_idx = 0;
+                row++;
+            }
+        }
+        if (col_idx > 0)
+            row++;
+    }
+
+    row++;
+
+    if (row >= rows - 1)
+    {
+        refresh();
+        return;
+    }
+
+    attron(A_BOLD);
     mvprintw(row++, 2, "WAKEUP LATENCY");
     attroff(A_BOLD);
 
@@ -316,7 +394,7 @@ static void tui_draw(
     }
 
     max_b = 1;
-    for (i = 0; i < SNAP_LAT_BUCKETS; i++)
+    for (i = 0; i < QS_LAT_BUCKETS; i++)
         if (d_buckets[i] > max_b)
             max_b = d_buckets[i];
 
@@ -324,7 +402,7 @@ static void tui_draw(
     if (lat_w < 8)
         lat_w = 8;
     avail = rows - row - 1;
-    show = SNAP_LAT_BUCKETS < avail ? SNAP_LAT_BUCKETS : avail;
+    show = QS_LAT_BUCKETS < avail ? QS_LAT_BUCKETS : avail;
 
     for (int i = 0; i < show && row < rows - 1; i++)
     {
@@ -362,13 +440,15 @@ int main(int argc, char **argv)
         {"batch-cpuperf-pct", required_argument, 0, 1},
         {"no-cpuperf", no_argument, 0, 2},
         {"no-tui", no_argument, 0, 3},
+        {"slo-us", required_argument, 0, 4},
         {"stats-interval", required_argument, 0, 's'},
         {"verbose", no_argument, 0, 'v'},
+        {"version", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
         {0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:b:n:p:s:vh", long_opts, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "i:b:n:p:s:vVh", long_opts, NULL)) != -1)
     {
         switch (opt)
         {
@@ -393,12 +473,18 @@ int main(int argc, char **argv)
         case 3:
             no_tui = 1;
             break;
+        case 4:
+            slo_us = strtoull(optarg, NULL, 10);
+            break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
             break;
         case 'v':
             verbose = 1;
             break;
+        case 'V':
+            printf("scx_quicksched %s\n", QS_VERSION);
+            return 0;
         case 'h':
             usage(argv[0]);
             return 0;
@@ -416,7 +502,7 @@ int main(int argc, char **argv)
 
     libbpf_set_print(libbpf_print_fn);
 
-    struct scx_snap_bpf *skel = scx_snap_bpf__open();
+    struct scx_quicksched_bpf *skel = scx_quicksched_bpf__open();
     if (!skel)
     {
         char errbuf[256];
@@ -432,23 +518,23 @@ int main(int argc, char **argv)
     skel->rodata->enable_cpuperf = !no_cpuperf;
     skel->rodata->batch_cpuperf_abs = batch_cpuperf_pct * 1024 / 100;
 
-    int err = scx_snap_bpf__load(skel);
+    int err = scx_quicksched_bpf__load(skel);
     if (err)
     {
         char errbuf[256];
         libbpf_strerror(err, errbuf, sizeof(errbuf));
         fprintf(stderr, "failed to load BPF object: %s\n", errbuf);
-        scx_snap_bpf__destroy(skel);
+        scx_quicksched_bpf__destroy(skel);
         return 1;
     }
 
-    skel->links.scx_snap_ops = bpf_map__attach_struct_ops(skel->maps.scx_snap_ops);
-    if (!skel->links.scx_snap_ops)
+    skel->links.scx_quicksched_ops = bpf_map__attach_struct_ops(skel->maps.scx_quicksched_ops);
+    if (!skel->links.scx_quicksched_ops)
     {
         char errbuf[256];
         libbpf_strerror(-errno, errbuf, sizeof(errbuf));
         fprintf(stderr, "failed to attach scheduler: %s\n", errbuf);
-        scx_snap_bpf__destroy(skel);
+        scx_quicksched_bpf__destroy(skel);
         return 1;
     }
 
@@ -461,7 +547,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        printf("scx_snap — developed by Aniketh T S\n");
+        printf("scx_quicksched (Quicksched) — developed by Aniketh T S\n");
         printf("  slices: interactive=%lluus batch=%lluus\n",
                (unsigned long long)interactive_slice_us,
                (unsigned long long)batch_slice_us);
@@ -471,17 +557,37 @@ int main(int argc, char **argv)
             printf("  cpuperf: interactive=100%% batch=%u%%\n", batch_cpuperf_pct);
     }
 
-    struct snap_stats prev_stats = {};
-    struct snap_latency prev_lat = {};
+    int ncpus = libbpf_num_possible_cpus();
+    if (ncpus < 1)
+        ncpus = 1;
+
+    struct qs_cpu_load *prev_cpu_loads = calloc(ncpus, sizeof(*prev_cpu_loads));
+    struct qs_cpu_load *cur_cpu_loads  = calloc(ncpus, sizeof(*cur_cpu_loads));
+    uint64_t *d_cpu = calloc(ncpus, sizeof(*d_cpu));
+    if (!prev_cpu_loads || !cur_cpu_loads || !d_cpu)
+    {
+        fprintf(stderr, "error: out of memory\n");
+        if (!no_tui)
+            endwin();
+        free(prev_cpu_loads);
+        free(cur_cpu_loads);
+        free(d_cpu);
+        scx_quicksched_bpf__destroy(skel);
+        return 1;
+    }
+
+    struct qs_stats prev_stats = {};
+    struct qs_latency prev_lat = {};
     time_t start_time = time(NULL);
 
     if (!no_tui)
     {
-        uint64_t zero[SNAP_LAT_BUCKETS] = {};
+        uint64_t zero[QS_LAT_BUCKETS] = {};
         tui_draw(interactive_slice_us, batch_slice_us,
                  nice_interactive_max, interactive_sleep_pct,
                  no_cpuperf,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0);
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0,
+                 slo_us, NULL, 0);
     }
 
     while (!stop)
@@ -493,11 +599,17 @@ int main(int argc, char **argv)
         if (!stats_interval)
             continue;
 
-        struct snap_stats cur_stats = {};
-        struct snap_latency cur_lat = {};
+        struct qs_stats cur_stats = {};
+        struct qs_latency cur_lat = {};
 
         read_percpu(skel->maps.stats, &cur_stats, sizeof(cur_stats));
         read_percpu(skel->maps.latency, &cur_lat, sizeof(cur_lat));
+        read_percpu_array(skel->maps.cpu_load, cur_cpu_loads,
+                          sizeof(*cur_cpu_loads), ncpus);
+        for (int i = 0; i < ncpus; i++)
+            d_cpu[i] = cur_cpu_loads[i].nr_dispatch >= prev_cpu_loads[i].nr_dispatch
+                           ? cur_cpu_loads[i].nr_dispatch - prev_cpu_loads[i].nr_dispatch
+                           : 0;
 
         uint64_t d_int = cur_stats.nr_interactive >= prev_stats.nr_interactive
                              ? cur_stats.nr_interactive - prev_stats.nr_interactive
@@ -522,8 +634,8 @@ int main(int argc, char **argv)
         uint64_t d_total_ns = cur_lat.total_ns >= prev_lat.total_ns
                                   ? cur_lat.total_ns - prev_lat.total_ns
                                   : 0;
-        uint64_t d_buckets[SNAP_LAT_BUCKETS];
-        for (int i = 0; i < SNAP_LAT_BUCKETS; i++)
+        uint64_t d_buckets[QS_LAT_BUCKETS];
+        for (int i = 0; i < QS_LAT_BUCKETS; i++)
             d_buckets[i] = cur_lat.buckets[i] >= prev_lat.buckets[i]
                                ? cur_lat.buckets[i] - prev_lat.buckets[i]
                                : 0;
@@ -541,7 +653,7 @@ int main(int argc, char **argv)
                      d_int, d_batch, d_local,
                      d_preempted, d_memalloc,
                      d_count, avg_us, p50, p99, d_buckets,
-                     uptime_s);
+                     uptime_s, slo_us, d_cpu, ncpus);
         }
         else
         {
@@ -557,21 +669,31 @@ int main(int argc, char **argv)
                        (unsigned long long)d_preempted,
                        (unsigned long long)d_memalloc);
             if (d_count > 0)
+            {
                 printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",
                        (unsigned long long)avg_us,
                        (unsigned long long)p50,
                        (unsigned long long)p99,
                        (unsigned long long)d_count);
+                if (slo_us > 0 && p99 > slo_us)
+                    printf("!! LATENCY SLO BREACH: p99=%lluus > %lluus !!\n",
+                           (unsigned long long)p99, (unsigned long long)slo_us);
+            }
         }
 
         prev_stats = cur_stats;
         prev_lat = cur_lat;
+        memcpy(prev_cpu_loads, cur_cpu_loads, ncpus * sizeof(*cur_cpu_loads));
     }
 
     if (!no_tui)
         endwin();
 
-    printf("scx_snap exiting\n");
-    scx_snap_bpf__destroy(skel);
+    free(prev_cpu_loads);
+    free(cur_cpu_loads);
+    free(d_cpu);
+
+    printf("scx_quicksched exiting\n");
+    scx_quicksched_bpf__destroy(skel);
     return 0;
 }

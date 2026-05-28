@@ -1,4 +1,4 @@
-# scx_snap
+# Quicksched
 
 A latency-optimized Linux CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx). Keeps interactive tasks (UI, audio, input handling) feeling snappy by separating them from batch and background work, with memory-pressure awareness and live TUI monitoring.
 
@@ -20,7 +20,7 @@ Each CPU has its own interactive DSQ. When an interactive task wakes from I/O, i
 
 ### Safety
 
-The BPF struct_ops link is tied to the userspace process file descriptor. If `scx_snap` exits or crashes, the kernel automatically reverts all tasks to CFS. `timeout_ms = 30000` is set in the ops struct as an additional safeguard: the kernel self-reverts if any task fails to make progress for 30 seconds.
+The BPF struct_ops link is tied to the userspace process file descriptor. If `scx_quicksched` exits or crashes, the kernel automatically reverts all tasks to CFS. `timeout_ms = 30000` is set in the ops struct as an additional safeguard: the kernel self-reverts if any task fails to make progress for 30 seconds.
 
 ## Kernel compatibility
 
@@ -60,13 +60,13 @@ sudo make install PREFIX=/usr            # installs to /usr/bin
 sudo make uninstall                      # removes installed files
 ```
 
-`make install` also installs the man page (`man scx_snap`) and the systemd unit file.
+`make install` also installs the man page (`man scx_quicksched`) and the systemd unit file.
 
 ## Run
 
 ```sh
-sudo ./scx_snap           # interactive TUI
-sudo ./scx_snap --no-tui  # plain text output
+sudo ./scx_quicksched           # interactive TUI
+sudo ./scx_quicksched --no-tui  # plain text output
 ```
 
 Press Ctrl-C to stop. The kernel reverts all tasks to CFS automatically on exit.
@@ -74,14 +74,14 @@ Press Ctrl-C to stop. The kernel reverts all tasks to CFS automatically on exit.
 Tune slices, nice threshold, or CPU frequency behaviour:
 
 ```sh
-sudo scx_snap -i 3000 -b 15000 -n -1 --batch-cpuperf-pct 30
+sudo scx_quicksched -i 3000 -b 15000 -n -1 --batch-cpuperf-pct 30
 ```
 
 ## Run as a service
 
 ```sh
-sudo systemctl enable --now scx_snap
-sudo systemctl status scx_snap
+sudo systemctl enable --now scx_quicksched
+sudo systemctl status scx_quicksched
 ```
 
 The unit restarts automatically on failure (`Restart=on-failure`). It will not start on kernels that do not expose `/sys/kernel/sched_ext`.
@@ -113,14 +113,14 @@ The ncurses TUI refreshes every stats interval and shows three sections:
 
 ```
 src/
-  scx_snap.c          userspace: TUI, stats, BPF skeleton lifecycle
+  scx_quicksched.c          userspace: TUI, stats, BPF skeleton lifecycle
   bpf/
-    scx_snap.bpf.c    BPF scheduler implementation
-    scx_snap.h        shared types and constants
+    scx_quicksched.bpf.c    BPF scheduler implementation
+    scx_quicksched.h        shared types and constants
 man/
-  scx_snap.1          man page
+  scx_quicksched.1          man page
 packaging/
-  scx_snap.service    systemd unit file
+  scx_quicksched.service    systemd unit file
 .github/workflows/
   ci.yml              GitHub Actions CI
 Makefile

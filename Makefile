@@ -30,9 +30,9 @@ UNITDIR ?= /lib/systemd/system
 BUILDDIR      := build
 VMLINUX       := $(BUILDDIR)/vmlinux.h
 VMLINUX_STAMP := $(BUILDDIR)/.vmlinux-$(KVER).stamp
-BPF_OBJ       := $(BUILDDIR)/scx_snap.bpf.o
-SKEL_H        := $(BUILDDIR)/scx_snap.skel.h
-TARGET        := scx_snap
+BPF_OBJ       := $(BUILDDIR)/scx_quicksched.bpf.o
+SKEL_H        := $(BUILDDIR)/scx_quicksched.skel.h
+TARGET        := scx_quicksched
 
 .PHONY: all clean clean-full install uninstall check-deps
 
@@ -60,25 +60,25 @@ $(VMLINUX_STAMP): | $(BUILDDIR)
 
 $(VMLINUX): $(VMLINUX_STAMP)
 
-$(BPF_OBJ): src/bpf/scx_snap.bpf.c src/bpf/scx_snap.h $(VMLINUX) | $(BUILDDIR)
+$(BPF_OBJ): src/bpf/scx_quicksched.bpf.c src/bpf/scx_quicksched.h $(VMLINUX) | $(BUILDDIR)
 	$(BPF_CC) $(BPF_FLAGS) -I$(BUILDDIR) -Isrc/bpf -I/usr/include -c $< -o $@
 
 $(SKEL_H): $(BPF_OBJ) | $(BUILDDIR)
 	bpftool gen skeleton $< > $@
 
-$(TARGET): src/scx_snap.c src/bpf/scx_snap.h $(SKEL_H)
+$(TARGET): src/scx_quicksched.c src/bpf/scx_quicksched.h $(SKEL_H)
 	$(CC) $(CFLAGS) -I$(BUILDDIR) -Isrc/bpf $< $(LDFLAGS) -lbpf -lncurses -o $@
 
 
 install: $(TARGET)
-	install -Dm755 $(TARGET)                    $(DESTDIR)$(BINDIR)/$(TARGET)
-	install -Dm644 man/scx_snap.1               $(DESTDIR)$(MANDIR)/scx_snap.1
-	install -Dm644 packaging/scx_snap.service   $(DESTDIR)$(UNITDIR)/scx_snap.service
+	install -Dm755 $(TARGET)                          $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -Dm644 man/scx_quicksched.1               $(DESTDIR)$(MANDIR)/scx_quicksched.1
+	install -Dm644 packaging/scx_quicksched.service   $(DESTDIR)$(UNITDIR)/scx_quicksched.service
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
-	rm -f $(DESTDIR)$(MANDIR)/scx_snap.1
-	rm -f $(DESTDIR)$(UNITDIR)/scx_snap.service
+	rm -f $(DESTDIR)$(MANDIR)/scx_quicksched.1
+	rm -f $(DESTDIR)$(UNITDIR)/scx_quicksched.service
 
 clean:
 	rm -f $(BPF_OBJ) $(SKEL_H) $(TARGET)
