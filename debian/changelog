@@ -1,4 +1,4 @@
-scx-quicksched (0.2.0-1) noble; urgency=medium
+scx-quicksched (0.2.0) noble; urgency=medium
 
   * Initial Debian/Ubuntu packaging.
   * PSI memory-pressure awareness with --mem-pressure-pct.
