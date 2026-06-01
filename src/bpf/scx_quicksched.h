@@ -15,6 +15,13 @@
 #define QS_MIN_WAKEUPS 4
 #define QS_EWMA_WEIGHT 7
 
+/* Sleep duration above which a batch task gets one interactive boost on wake. */
+#define QS_WAKEUP_BOOST_SLEEP_NS 50000000ULL /* 50 ms */
+/* Minimum cpuperf delta before we actually call scx_bpf_cpuperf_set (hysteresis). */
+#define QS_CPUPERF_HYSTERESIS 52 /* ~5 % of 1024 */
+/* Batch vruntime lag window: tasks can't be more than this far behind the present. */
+#define QS_VTIME_LAG_NS 100000000ULL /* 100 ms */
+
 #define QS_LAT_BUCKETS 20
 
 /* Tasks whose scx.weight is below this threshold are classified as batch
@@ -40,8 +47,10 @@ struct qs_task_ctx
     __u64 enqueue_at;
     __u64 assigned_slice_ns;
     __u64 slice_util_ewma; /* EWMA of slice utilisation % (0-100); 100 = CPU-bound */
+    __u64 vruntime;        /* accumulated CPU time; used for vtime-ordered batch DSQ */
     __u32 wakeups;
-    __u8 pad[4];
+    __u8 wakeup_boost; /* 1 = grant one interactive dispatch after long sleep */
+    __u8 pad[3];
 };
 
 struct qs_stats
@@ -49,11 +58,12 @@ struct qs_stats
     __u64 nr_interactive;
     __u64 nr_batch;
     __u64 nr_local;
-    __u64 nr_preempted; /* tasks that stopped before exhausting their slice */
-    __u64 nr_memalloc;  /* tasks demoted to batch due to PF_MEMALLOC */
-    __u64 nr_stolen;    /* tasks work-stolen from another CPU's interactive DSQ */
-    __u64 nr_mem_stall; /* dispatches where slice_util_ewma < 40 (RAM-bound) */
-    __u64 nr_rt_like;   /* dispatches for ultra-interactive (nice <= nice_rt_max) */
+    __u64 nr_preempted;      /* tasks that stopped before exhausting their slice */
+    __u64 nr_memalloc;       /* tasks demoted to batch due to PF_MEMALLOC */
+    __u64 nr_stolen;         /* tasks work-stolen from another CPU's interactive DSQ */
+    __u64 nr_mem_stall;      /* dispatches where slice_util_ewma < 40 (RAM-bound) */
+    __u64 nr_rt_like;        /* dispatches for ultra-interactive (nice <= nice_rt_max) */
+    __u64 nr_wakeup_boosted; /* batch tasks granted one interactive dispatch on wake */
 };
 
 /* Written by userspace when PSI memory pressure exceeds a threshold.

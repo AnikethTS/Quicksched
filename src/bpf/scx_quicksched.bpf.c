@@ -66,6 +66,24 @@ struct
     __type(value, struct qs_exit_info);
 } exit_info SEC(".maps");
 
+/* CPU → NUMA node mapping; populated by userspace from /sys/devices/system/node. */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, QS_MAX_CPUS);
+    __type(key, __u32);
+    __type(value, __u32);
+} cpu_node SEC(".maps");
+
+/* Per-CPU last-set cpuperf value for hysteresis (avoid micro-adjustments). */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} last_cpuperf SEC(".maps");
+
 const volatile __u64 slice_interactive_ns = QS_SLICE_INTERACTIVE_NS;
 const volatile __u64 slice_batch_ns = QS_SLICE_BATCH_NS;
 const volatile __s32 nice_interactive_max = 0;
@@ -76,6 +94,8 @@ const volatile __s32 nice_rt_max = -10;
 
 extern int scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 extern void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym;
+extern void scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id, u64 slice, u64 vtime,
+                                     u64 enq_flags) __ksym;
 extern bool scx_bpf_dsq_move_to_local(u64 dsq_id) __ksym;
 extern void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
 extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
@@ -204,6 +224,9 @@ int BPF_PROG(scx_quicksched_runnable, struct task_struct *p, u64 enq_flags)
         tctx->wakeups++;
         tctx->sleep_at = 0;
         tctx->enqueue_at = scx_bpf_now();
+
+        if (sleep_dur >= QS_WAKEUP_BOOST_SLEEP_NS)
+            tctx->wakeup_boost = 1;
     }
     return 0;
 }
@@ -231,7 +254,9 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
                     eff_rt_max = dcfg->nice_rt_max_live;
             }
             bool rt_like = !(p->flags & PF_KTHREAD) && nice <= eff_rt_max;
-            bool interactive = rt_like || task_is_interactive(p, tctx);
+            bool boosted = tctx->wakeup_boost && !rt_like && !task_is_interactive(p, tctx);
+            tctx->wakeup_boost = 0;
+            bool interactive = rt_like || boosted || task_is_interactive(p, tctx);
             __u64 slice = rt_like       ? QS_SLICE_RT_LIKE_NS
                           : interactive ? slice_interactive_ns
                                         : slice_batch_ns;
@@ -245,6 +270,8 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             {
                 if (rt_like)
                     st->nr_rt_like++;
+                else if (boosted)
+                    st->nr_wakeup_boosted++;
                 else
                     st->nr_local++;
             }
@@ -267,7 +294,10 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (p->flags & PF_MEMALLOC)
     {
-        scx_bpf_dsq_insert(p, QS_DSQ_BATCH, slice_batch_ns, enq_flags);
+        /* Memory-reclaim tasks: insert at head of batch vtime queue (lowest vtime). */
+        u64 vtime_now = scx_bpf_now();
+        u64 vtime_front = vtime_now > QS_VTIME_LAG_NS ? vtime_now - QS_VTIME_LAG_NS : 0;
+        scx_bpf_dsq_insert_vtime(p, QS_DSQ_BATCH, slice_batch_ns, vtime_front, enq_flags);
         st = bpf_map_lookup_elem(&stats, &zero);
         if (st)
             st->nr_memalloc++;
@@ -307,7 +337,17 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         }
     }
 
-    interactive = task_is_interactive(p, tctx);
+    /* Wakeup boost: treat one enqueue after long sleep as interactive. */
+    bool boosted = tctx->wakeup_boost && !task_is_interactive(p, tctx);
+    tctx->wakeup_boost = 0;
+    if (boosted)
+    {
+        st = bpf_map_lookup_elem(&stats, &zero);
+        if (st)
+            st->nr_wakeup_boosted++;
+    }
+
+    interactive = boosted || task_is_interactive(p, tctx);
 
     if (interactive)
     {
@@ -322,11 +362,23 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
     }
     else
     {
-        slice = slice_batch_ns;
-        dsq_id = QS_DSQ_BATCH;
+        /* Vtime-ordered batch DSQ: CPU-hungry tasks dispatched later, preventing starvation. */
+        u64 now = scx_bpf_now();
+        u64 lag_floor = now > QS_VTIME_LAG_NS ? now - QS_VTIME_LAG_NS : 0;
+        if (tctx->vruntime < lag_floor)
+            tctx->vruntime = lag_floor;
+        tctx->assigned_slice_ns = slice_batch_ns;
+
         struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
         if (bd)
             __sync_fetch_and_add(&bd->depth, 1LL);
+
+        scx_bpf_dsq_insert_vtime(p, QS_DSQ_BATCH, slice_batch_ns, tctx->vruntime, enq_flags);
+
+        st = bpf_map_lookup_elem(&stats, &zero);
+        if (st)
+            st->nr_batch++;
+        return 0;
     }
 
     tctx->assigned_slice_ns = slice;
@@ -334,12 +386,7 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 
     st = bpf_map_lookup_elem(&stats, &zero);
     if (st)
-    {
-        if (interactive)
-            st->nr_interactive++;
-        else
-            st->nr_batch++;
-    }
+        st->nr_interactive++;
     return 0;
 }
 
@@ -365,15 +412,41 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
         goto dispatched;
     }
 
-    /* Work-steal: use a stride to cover the whole machine evenly, not just
-     * 8 sequential neighbours.  On a 64-core box the stride is 4, so we
-     * sample every 4th CPU — far side of NUMA included. */
+    /* Work-steal: NUMA-aware two-pass.
+     * Pass 1 prefers CPUs on the same NUMA node (lower cache-miss cost).
+     * Pass 2 falls back to cross-node steal so no work is left stranded. */
     if (cpu >= 0)
     {
+        u32 cpu_key = (u32)cpu;
+        u32 my_node = 0;
+        u32 *np = bpf_map_lookup_elem(&cpu_node, &cpu_key);
+        if (np)
+            my_node = *np;
+
         u32 stride = nr_cpus > QS_MAX_STEAL_CPUS ? nr_cpus / QS_MAX_STEAL_CPUS : 1;
+
         for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
         {
             u32 steal = ((u32)cpu + i * stride) % nr_cpus;
+            u32 *sn = bpf_map_lookup_elem(&cpu_node, &steal);
+            if (!sn || *sn != my_node)
+                continue;
+            if (scx_bpf_dsq_move_to_local((u64)steal))
+            {
+                struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
+                if (st)
+                    st->nr_stolen++;
+                is_interactive = 1;
+                goto dispatched;
+            }
+        }
+
+        for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
+        {
+            u32 steal = ((u32)cpu + i * stride) % nr_cpus;
+            u32 *sn = bpf_map_lookup_elem(&cpu_node, &steal);
+            if (sn && *sn == my_node)
+                continue;
             if (scx_bpf_dsq_move_to_local((u64)steal))
             {
                 struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
@@ -467,7 +540,17 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
                 perf = base + (u32)extra;
             }
         }
-        scx_bpf_cpuperf_set(cpu, perf);
+        /* Hysteresis: skip the syscall if the new value is close to the last. */
+        __u32 lp_zero = 0;
+        __u32 *lp = bpf_map_lookup_elem(&last_cpuperf, &lp_zero);
+        __u32 last_p = lp ? *lp : 0;
+        __u32 diff = perf > last_p ? perf - last_p : last_p - perf;
+        if (diff >= QS_CPUPERF_HYSTERESIS)
+        {
+            scx_bpf_cpuperf_set(cpu, perf);
+            if (lp)
+                *lp = perf;
+        }
     }
 
     if (tctx->enqueue_at > 0)
@@ -491,6 +574,7 @@ int BPF_PROG(scx_quicksched_stopping, struct task_struct *p, bool runnable)
         __u64 run_dur = scx_bpf_now() - tctx->run_at;
 
         tctx->sum_run_ns = (tctx->sum_run_ns * QS_EWMA_WEIGHT + run_dur) / (QS_EWMA_WEIGHT + 1);
+        tctx->vruntime += run_dur;
         tctx->run_at = 0;
 
         if (tctx->assigned_slice_ns > 0)
@@ -532,7 +616,9 @@ s32 BPF_PROG(scx_quicksched_init_task, struct task_struct *p, struct scx_init_ta
     tctx->sleep_at = 0;
     tctx->enqueue_at = 0;
     tctx->assigned_slice_ns = 0;
+    tctx->vruntime = 0;
     tctx->wakeups = 0;
+    tctx->wakeup_boost = 0;
     /* Start optimistic so a new task isn't penalised before its first wakeup. */
     tctx->slice_util_ewma = 100;
 
