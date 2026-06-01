@@ -24,6 +24,7 @@ static uint32_t io_pressure_pct = 0;
 static int32_t nice_rt_max_cfg = -10;
 static const char *pidfile_path = NULL;
 static int json_mode = 0;
+static uint32_t thermal_limit_c = 0;
 
 /* ── TUI settings panel ─────────────────────────────────────────────────── */
 static int settings_open = 0;
@@ -96,6 +97,35 @@ static bool read_psi_io(struct qs_psi *out)
     }
     fclose(f);
     return true;
+}
+
+/* Returns CPU package temperature in milli-Celsius, or -1 if unavailable. */
+static int read_cpu_temp_mc(void)
+{
+    for (int i = 0; i < 64; i++)
+    {
+        char tpath[128], type[64];
+        snprintf(tpath, sizeof(tpath), "/sys/class/thermal/thermal_zone%d/type", i);
+        FILE *f = fopen(tpath, "r");
+        if (!f)
+            break;
+        bool is_cpu = fgets(type, sizeof(type), f) &&
+                      (strstr(type, "cpu") || strstr(type, "pkg") || strstr(type, "x86"));
+        fclose(f);
+        if (!is_cpu)
+            continue;
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+        f = fopen(path, "r");
+        if (!f)
+            continue;
+        int temp;
+        bool ok = (fscanf(f, "%d", &temp) == 1);
+        fclose(f);
+        if (ok)
+            return temp;
+    }
+    return -1;
 }
 
 /* scx_exit_kind ranges (stable across kernel versions within a range) */
@@ -443,7 +473,8 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
                      uint64_t p99, uint64_t *d_buckets, uint64_t uptime_s, uint64_t slo_alert_us,
                      const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu,
                      uint64_t *d_cpu_interactive, int ncpus, uint64_t d_rt_like, uint64_t d_stolen,
-                     uint64_t d_wakeup_boosted, const struct qs_psi *io_psi)
+                     uint64_t d_wakeup_boosted, uint64_t d_burst, uint64_t d_rt_preempt,
+                     float cpu_temp_c, const struct qs_psi *io_psi)
 {
     int rows, cols;
     char uts[32];
@@ -504,11 +535,12 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
         uint64_t val;
         int cp;
     } srows[] = {
-        {"  rt-like    ", d_rt_like, CP_WARN}, {"  interactive", d_int, CP_IACTIVE},
-        {"  batch      ", d_batch, CP_BATCH},  {"  idle-fast  ", d_local, CP_IDLE},
-        {"  stolen     ", d_stolen, CP_DIM},   {"  woke-boost ", d_wakeup_boosted, CP_LAT},
+        {"  rt-like    ", d_rt_like, CP_WARN},  {"  interactive", d_int, CP_IACTIVE},
+        {"  batch      ", d_batch, CP_BATCH},   {"  idle-fast  ", d_local, CP_IDLE},
+        {"  stolen     ", d_stolen, CP_DIM},    {"  woke-boost ", d_wakeup_boosted, CP_LAT},
+        {"  burst      ", d_burst, CP_IACTIVE}, {"  rt-preempt ", d_rt_preempt, CP_WARN},
     };
-    for (i = 0; i < 6 && row < rows - 1; i++)
+    for (i = 0; i < 8 && row < rows - 1; i++)
     {
         uint64_t pct = tot > 0 ? srows[i].val * 100 / tot : 0;
         attron(COLOR_PAIR(srows[i].cp));
@@ -531,6 +563,13 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     attron(A_BOLD);
     mvprintw(row, 2, "MEMORY");
     attroff(A_BOLD);
+    if (cpu_temp_c > 0)
+    {
+        int tcp = cpu_temp_c > 85.0f ? CP_WARN : cpu_temp_c > 70.0f ? CP_BATCH : CP_DIM;
+        attron(COLOR_PAIR(tcp));
+        mvprintw(row, 44, "CPU %.0f°C", cpu_temp_c);
+        attroff(COLOR_PAIR(tcp));
+    }
     if (psi)
     {
         int psi_cp = psi->some_avg10 > 20.0f ? CP_WARN : psi->some_avg10 > 5.0f ? CP_BATCH : CP_DIM;
@@ -756,6 +795,41 @@ static void init_numa_map(struct scx_quicksched_bpf *skel)
     }
 }
 
+static void init_llc_map(struct scx_quicksched_bpf *skel)
+{
+    int ncpus = libbpf_num_possible_cpus();
+
+    /* Default: each CPU is its own LLC domain. */
+    for (int cpu = 0; cpu < ncpus && cpu < QS_MAX_CPUS; cpu++)
+    {
+        uint32_t key = (uint32_t)cpu, val = (uint32_t)cpu;
+        bpf_map__update_elem(skel->maps.cpu_llc, &key, sizeof(key), &val, sizeof(val), BPF_ANY);
+    }
+
+    /* Override from sysfs (try L3 index3, fall back to L2 index2). */
+    for (int cpu = 0; cpu < ncpus && cpu < QS_MAX_CPUS; cpu++)
+    {
+        int id = -1;
+        for (int idx = 3; idx >= 2 && id < 0; idx--)
+        {
+            char path[256];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/id", cpu,
+                     idx);
+            FILE *f = fopen(path, "r");
+            if (!f)
+                continue;
+            if (fscanf(f, "%d", &id) != 1)
+                id = -1;
+            fclose(f);
+        }
+        if (id >= 0)
+        {
+            uint32_t key = (uint32_t)cpu, val = (uint32_t)id;
+            bpf_map__update_elem(skel->maps.cpu_llc, &key, sizeof(key), &val, sizeof(val), BPF_ANY);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint64_t interactive_slice_us = 5000;
@@ -780,6 +854,7 @@ int main(int argc, char **argv)
                                               {"nice-rt-max", required_argument, 0, 8},
                                               {"pidfile", required_argument, 0, 9},
                                               {"json", no_argument, 0, 10},
+                                              {"thermal-limit", required_argument, 0, 11},
                                               {"stats-interval", required_argument, 0, 's'},
                                               {"verbose", no_argument, 0, 'v'},
                                               {"version", no_argument, 0, 'V'},
@@ -833,6 +908,9 @@ int main(int argc, char **argv)
         case 10:
             json_mode = 1;
             no_tui = 1;
+            break;
+        case 11:
+            thermal_limit_c = (uint32_t)strtoul(optarg, NULL, 10);
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -888,6 +966,7 @@ int main(int argc, char **argv)
     }
 
     init_numa_map(skel);
+    init_llc_map(skel);
 
     if (dry_run)
     {
@@ -964,13 +1043,15 @@ int main(int argc, char **argv)
     /* Cache of last-drawn TUI data for instant redraw on keypress. */
     struct
     {
-        uint64_t d_int, d_batch, d_local, d_rt_like, d_stolen, d_wakeup_boosted;
+        uint64_t d_int, d_batch, d_local, d_rt_like, d_stolen, d_wakeup_boosted, d_burst,
+            d_rt_preempt;
         uint64_t d_preempted, d_memalloc, d_mem_stall;
         uint64_t d_count, avg_us, p50, p99;
         uint64_t d_buckets[QS_LAT_BUCKETS];
         uint64_t uptime_s;
         struct qs_psi psi, io_psi;
         int psi_ok, io_psi_ok, psi_throttled;
+        float cpu_temp_c;
     } cache = {};
 
     if (!no_tui)
@@ -978,7 +1059,7 @@ int main(int argc, char **argv)
         uint64_t zero[QS_LAT_BUCKETS] = {};
         tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max, interactive_sleep_pct,
                  no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, NULL, 0,
-                 0, 0, 0, NULL);
+                 0, 0, 0, 0, 0, -1.0f, NULL);
     }
 
     while (!stop)
@@ -999,7 +1080,8 @@ int main(int argc, char **argv)
                              cache.d_count, cache.avg_us, cache.p50, cache.p99, cache.d_buckets,
                              cache.uptime_s, slo_us, cache.psi_ok ? &cache.psi : NULL,
                              cache.psi_throttled, d_cpu, d_cpu_interactive, ncpus, cache.d_rt_like,
-                             cache.d_stolen, cache.d_wakeup_boosted,
+                             cache.d_stolen, cache.d_wakeup_boosted, cache.d_burst,
+                             cache.d_rt_preempt, cache.cpu_temp_c,
                              cache.io_psi_ok ? &cache.io_psi : NULL);
                     if (settings_open)
                         draw_settings_panel();
@@ -1019,6 +1101,7 @@ int main(int argc, char **argv)
         int psi_ok = (int)read_psi_memory(&psi);
         int io_psi_ok = (int)read_psi_io(&io_psi);
         int psi_throttled = 0;
+        float cpu_temp_c = thermal_limit_c > 0 ? read_cpu_temp_mc() / 1000.0f : -1.0f;
 
         if (mem_pressure_pct > 0 || io_pressure_pct > 0)
         {
@@ -1064,7 +1147,26 @@ int main(int argc, char **argv)
                 }
             }
 
-            /* Always include live TUI settings so they survive PSI rewrites. */
+            /* Thermal: take the more restrictive of PSI and thermal overrides. */
+            if (thermal_limit_c > 0 && cpu_temp_c > (float)thermal_limit_c)
+            {
+                float excess = (cpu_temp_c - (float)thermal_limit_c) / 10.0f;
+                if (excess > 1.0f)
+                    excess = 1.0f;
+                float scale = 0.75f - 0.5f * excess;
+                uint32_t tval = (uint32_t)((float)base * scale);
+                if (tval < 128)
+                    tval = 128;
+                if (dcfg.batch_cpuperf_abs_override == 0 || tval < dcfg.batch_cpuperf_abs_override)
+                    dcfg.batch_cpuperf_abs_override = tval;
+                psi_throttled = 1;
+                if (!psi_throttled)
+                    psi_throttle_cooldown = 3;
+            }
+            if (dcfg.batch_cpuperf_abs_override > 0)
+                psi_throttled = 1;
+
+            /* Always include live TUI settings so they survive PSI/thermal rewrites. */
             dcfg.batch_cpuperf_live = tui_batch_cpuperf_live;
             dcfg.nice_rt_max_live = tui_nice_rt_max_live;
             dcfg.nice_rt_max_set = (uint32_t)tui_nice_rt_max_set;
@@ -1073,13 +1175,27 @@ int main(int argc, char **argv)
         }
         else
         {
-            /* No PSI throttling configured — still push live TUI settings. */
+            /* No PSI throttling configured — still push live TUI settings + thermal. */
             struct qs_dynamic_cfg dcfg = {
                 .batch_cpuperf_live = tui_batch_cpuperf_live,
                 .nice_rt_max_live = tui_nice_rt_max_live,
                 .nice_rt_max_set = (uint32_t)tui_nice_rt_max_set,
             };
             uint32_t key = 0;
+            if (thermal_limit_c > 0 && cpu_temp_c > (float)thermal_limit_c)
+            {
+                uint32_t base = skel->rodata->batch_cpuperf_abs;
+                float excess = (cpu_temp_c - (float)thermal_limit_c) / 10.0f;
+                if (excess > 1.0f)
+                    excess = 1.0f;
+                float scale = 0.75f - 0.5f * excess;
+                uint32_t tval = (uint32_t)((float)base * scale);
+                if (tval < 128)
+                    tval = 128;
+                dcfg.batch_cpuperf_abs_override = tval;
+                psi_throttled = 1;
+                psi_throttled = 1;
+            }
             bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg),
                                  BPF_ANY);
         }
@@ -1126,6 +1242,12 @@ int main(int argc, char **argv)
         uint64_t d_wakeup_boosted = cur_stats.nr_wakeup_boosted >= prev_stats.nr_wakeup_boosted
                                         ? cur_stats.nr_wakeup_boosted - prev_stats.nr_wakeup_boosted
                                         : 0;
+        uint64_t d_burst = cur_stats.nr_burst >= prev_stats.nr_burst
+                               ? cur_stats.nr_burst - prev_stats.nr_burst
+                               : 0;
+        uint64_t d_rt_preempt = cur_stats.nr_rt_preempt >= prev_stats.nr_rt_preempt
+                                    ? cur_stats.nr_rt_preempt - prev_stats.nr_rt_preempt
+                                    : 0;
 
         uint64_t d_count = cur_lat.count >= prev_lat.count ? cur_lat.count - prev_lat.count : 0;
         uint64_t d_total_ns =
@@ -1151,6 +1273,9 @@ int main(int argc, char **argv)
             cache.d_rt_like = d_rt_like;
             cache.d_stolen = d_stolen;
             cache.d_wakeup_boosted = d_wakeup_boosted;
+            cache.d_burst = d_burst;
+            cache.d_rt_preempt = d_rt_preempt;
+            cache.cpu_temp_c = cpu_temp_c;
             cache.d_preempted = d_preempted;
             cache.d_memalloc = d_memalloc;
             cache.d_mem_stall = d_mem_stall;
@@ -1170,7 +1295,8 @@ int main(int argc, char **argv)
                      interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
                      d_memalloc, d_mem_stall, d_count, avg_us, p50, p99, d_buckets, uptime_s,
                      slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus,
-                     d_rt_like, d_stolen, d_wakeup_boosted, io_psi_ok ? &io_psi : NULL);
+                     d_rt_like, d_stolen, d_wakeup_boosted, d_burst, d_rt_preempt, cpu_temp_c,
+                     io_psi_ok ? &io_psi : NULL);
             if (settings_open)
                 draw_settings_panel();
         }
@@ -1179,20 +1305,23 @@ int main(int argc, char **argv)
             uint64_t uptime_s = (uint64_t)(time(NULL) - start_time);
             printf("{\"ts\":%lu,\"interactive\":%llu,\"batch\":%llu,\"rt_like\":%llu,"
                    "\"idle_fast\":%llu,\"stolen\":%llu,\"wakeup_boosted\":%llu,"
+                   "\"burst\":%llu,\"rt_preempt\":%llu,"
                    "\"preempted\":%llu,\"memalloc\":%llu,\"mem_stall\":%llu,"
                    "\"lat_avg_us\":%llu,\"lat_p50_us\":%llu,\"lat_p99_us\":%llu,"
                    "\"lat_n\":%llu,\"psi_mem_some\":%.2f,\"psi_mem_full\":%.2f,"
                    "\"psi_io_some\":%.2f,\"psi_io_full\":%.2f,"
-                   "\"throttled\":%d,\"uptime_s\":%lu}\n",
+                   "\"cpu_temp_c\":%.1f,\"throttled\":%d,\"uptime_s\":%lu}\n",
                    (unsigned long)time(NULL), (unsigned long long)d_int,
                    (unsigned long long)d_batch, (unsigned long long)d_rt_like,
                    (unsigned long long)d_local, (unsigned long long)d_stolen,
-                   (unsigned long long)d_wakeup_boosted, (unsigned long long)d_preempted,
+                   (unsigned long long)d_wakeup_boosted, (unsigned long long)d_burst,
+                   (unsigned long long)d_rt_preempt, (unsigned long long)d_preempted,
                    (unsigned long long)d_memalloc, (unsigned long long)d_mem_stall,
                    (unsigned long long)avg_us, (unsigned long long)p50, (unsigned long long)p99,
                    (unsigned long long)d_count, psi_ok ? psi.some_avg10 : 0.0f,
                    psi_ok ? psi.full_avg10 : 0.0f, io_psi_ok ? io_psi.some_avg10 : 0.0f,
-                   io_psi_ok ? io_psi.full_avg10 : 0.0f, psi_throttled, (unsigned long)uptime_s);
+                   io_psi_ok ? io_psi.full_avg10 : 0.0f, cpu_temp_c > 0 ? cpu_temp_c : 0.0f,
+                   psi_throttled, (unsigned long)uptime_s);
             fflush(stdout);
         }
         else

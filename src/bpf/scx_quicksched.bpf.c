@@ -75,6 +75,15 @@ struct
     __type(value, __u32);
 } cpu_node SEC(".maps");
 
+/* CPU → LLC (last-level cache) domain; populated from /sys/devices/system/cpu. */
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, QS_MAX_CPUS);
+    __type(key, __u32);
+    __type(value, __u32);
+} cpu_llc SEC(".maps");
+
 /* Per-CPU last-set cpuperf value for hysteresis (avoid micro-adjustments). */
 struct
 {
@@ -227,6 +236,9 @@ int BPF_PROG(scx_quicksched_runnable, struct task_struct *p, u64 enq_flags)
 
         if (sleep_dur >= QS_WAKEUP_BOOST_SLEEP_NS)
             tctx->wakeup_boost = 1;
+        /* I/O-bound tasks (low util) also get a boost after short sleeps. */
+        else if (sleep_dur >= QS_IO_BOOST_SLEEP_NS && tctx->slice_util_ewma < 40)
+            tctx->wakeup_boost = 1;
     }
     return 0;
 }
@@ -257,9 +269,23 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             bool boosted = tctx->wakeup_boost && !rt_like && !task_is_interactive(p, tctx);
             tctx->wakeup_boost = 0;
             bool interactive = rt_like || boosted || task_is_interactive(p, tctx);
-            __u64 slice = rt_like       ? QS_SLICE_RT_LIKE_NS
-                          : interactive ? slice_interactive_ns
-                                        : slice_batch_ns;
+            __u64 slice;
+            if (rt_like)
+            {
+                slice = QS_SLICE_RT_LIKE_NS;
+            }
+            else if (interactive && tctx->burst_credit > 0)
+            {
+                slice = QS_SLICE_BURST_NS;
+                tctx->burst_credit--;
+                struct qs_stats *st_b = bpf_map_lookup_elem(&stats, &zero);
+                if (st_b)
+                    st_b->nr_burst++;
+            }
+            else
+            {
+                slice = interactive ? slice_interactive_ns : slice_batch_ns;
+            }
             struct qs_stats *st;
 
             tctx->assigned_slice_ns = slice;
@@ -351,14 +377,44 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (interactive)
     {
-        slice = slice_interactive_ns;
+        /* Vtime: tasks that sleep more (lower util) get dispatched sooner. */
+        u64 util = tctx->slice_util_ewma > 100 ? 100 : tctx->slice_util_ewma;
+        u64 sleep_credit = (100 - util) * QS_IVTIME_CREDIT_NS;
+        u64 vtime = scx_bpf_now() - sleep_credit;
+
+        /* Burst slice for interactive tasks consistently saturating their slice. */
+        if (tctx->burst_credit > 0)
+        {
+            slice = QS_SLICE_BURST_NS;
+            tctx->burst_credit--;
+            st = bpf_map_lookup_elem(&stats, &zero);
+            if (st)
+                st->nr_burst++;
+        }
+        else
+        {
+            slice = slice_interactive_ns;
+        }
+
         dsq_id = (sel_cpu >= 0 && sel_cpu < QS_MAX_CPUS) ? (u64)sel_cpu : 0;
+        tctx->assigned_slice_ns = slice;
+        scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
 
         if (enq_flags & SCX_ENQ_WAKEUP)
         {
-            dsq_flags = SCX_ENQ_HEAD;
             scx_bpf_kick_cpu(sel_cpu >= 0 ? sel_cpu : 0, SCX_KICK_PREEMPT);
+            /* Push-based LB: reschedule nearby idle CPUs to steal this task. */
+            u32 nr_cpus = scx_bpf_nr_cpu_ids();
+            u32 stride = nr_cpus > 4 ? nr_cpus / 4 : 1;
+            u32 base_cpu = (u32)(sel_cpu >= 0 ? sel_cpu : 0);
+            for (u32 pi = 1; pi <= 4; pi++)
+                scx_bpf_kick_cpu((base_cpu + pi * stride) % nr_cpus, 0);
         }
+
+        st = bpf_map_lookup_elem(&stats, &zero);
+        if (st)
+            st->nr_interactive++;
+        return 0;
     }
     else
     {
@@ -381,12 +437,6 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    tctx->assigned_slice_ns = slice;
-    scx_bpf_dsq_insert(p, dsq_id, slice, dsq_flags);
-
-    st = bpf_map_lookup_elem(&stats, &zero);
-    if (st)
-        st->nr_interactive++;
     return 0;
 }
 
@@ -412,24 +462,30 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
         goto dispatched;
     }
 
-    /* Work-steal: NUMA-aware two-pass.
-     * Pass 1 prefers CPUs on the same NUMA node (lower cache-miss cost).
-     * Pass 2 falls back to cross-node steal so no work is left stranded. */
+    /* Work-steal: three-pass cache-topology-aware order.
+     * Pass 1: same LLC  →  Pass 2: same NUMA / diff LLC  →  Pass 3: cross-NUMA.
+     * On single-socket machines all passes collapse to one (transparent). */
     if (cpu >= 0)
     {
         u32 cpu_key = (u32)cpu;
-        u32 my_node = 0;
+        u32 my_node = 0, my_llc = cpu_key;
         u32 *np = bpf_map_lookup_elem(&cpu_node, &cpu_key);
         if (np)
             my_node = *np;
+        u32 *lp = bpf_map_lookup_elem(&cpu_llc, &cpu_key);
+        if (lp)
+            my_llc = *lp;
 
         u32 stride = nr_cpus > QS_MAX_STEAL_CPUS ? nr_cpus / QS_MAX_STEAL_CPUS : 1;
 
+        /* Pass 1: same LLC (shared cache — lowest migration cost) */
         for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
         {
             u32 steal = ((u32)cpu + i * stride) % nr_cpus;
-            u32 *sn = bpf_map_lookup_elem(&cpu_node, &steal);
-            if (!sn || *sn != my_node)
+            if (steal >= QS_MAX_CPUS)
+                continue;
+            u32 *sl = bpf_map_lookup_elem(&cpu_llc, &steal);
+            if (!sl || *sl != my_llc)
                 continue;
             if (scx_bpf_dsq_move_to_local((u64)steal))
             {
@@ -441,12 +497,37 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
             }
         }
 
+        /* Pass 2: same NUMA node, different LLC */
         for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
         {
             u32 steal = ((u32)cpu + i * stride) % nr_cpus;
+            if (steal >= QS_MAX_CPUS)
+                continue;
+            u32 *sl = bpf_map_lookup_elem(&cpu_llc, &steal);
+            u32 *sn = bpf_map_lookup_elem(&cpu_node, &steal);
+            if (sl && *sl == my_llc)
+                continue; /* already tried in pass 1 */
+            if (!sn || *sn != my_node)
+                continue; /* skip cross-NUMA */
+            if (scx_bpf_dsq_move_to_local((u64)steal))
+            {
+                struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
+                if (st)
+                    st->nr_stolen++;
+                is_interactive = 1;
+                goto dispatched;
+            }
+        }
+
+        /* Pass 3: cross-NUMA (last resort) */
+        for (u32 i = 1; i <= QS_MAX_STEAL_CPUS; i++)
+        {
+            u32 steal = ((u32)cpu + i * stride) % nr_cpus;
+            if (steal >= QS_MAX_CPUS)
+                continue;
             u32 *sn = bpf_map_lookup_elem(&cpu_node, &steal);
             if (sn && *sn == my_node)
-                continue;
+                continue; /* already tried same-NUMA */
             if (scx_bpf_dsq_move_to_local((u64)steal))
             {
                 struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
@@ -585,13 +666,31 @@ int BPF_PROG(scx_quicksched_stopping, struct task_struct *p, bool runnable)
             tctx->slice_util_ewma =
                 (tctx->slice_util_ewma * QS_EWMA_WEIGHT + util) / (QS_EWMA_WEIGHT + 1);
 
-            /* Stayed runnable but used <90% of slice → preempted or stalled. */
-            if (runnable && util < 90)
             {
                 __u32 zero = 0;
                 struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
-                if (st)
-                    st->nr_preempted++;
+                if (runnable && st)
+                {
+                    /* Stayed runnable but used <90% of slice → preempted or stalled. */
+                    if (util < 90)
+                        st->nr_preempted++;
+                    /* Very short run while runnable → likely preempted by RT task. */
+                    if (run_dur < QS_RT_PREEMPT_NS)
+                        st->nr_rt_preempt++;
+                }
+                /* Burst credit: interactive task consistently saturating its slice. */
+                if (runnable && task_is_interactive(p, tctx))
+                {
+                    if (util >= QS_BURST_UTIL_THRESHOLD)
+                    {
+                        if (tctx->burst_credit < QS_BURST_CREDIT_MAX)
+                            tctx->burst_credit++;
+                    }
+                    else if (util < 60)
+                    {
+                        tctx->burst_credit = 0;
+                    }
+                }
             }
         }
     }
@@ -619,6 +718,7 @@ s32 BPF_PROG(scx_quicksched_init_task, struct task_struct *p, struct scx_init_ta
     tctx->vruntime = 0;
     tctx->wakeups = 0;
     tctx->wakeup_boost = 0;
+    tctx->burst_credit = 0;
     /* Start optimistic so a new task isn't penalised before its first wakeup. */
     tctx->slice_util_ewma = 100;
 

@@ -17,10 +17,22 @@
 
 /* Sleep duration above which a batch task gets one interactive boost on wake. */
 #define QS_WAKEUP_BOOST_SLEEP_NS 50000000ULL /* 50 ms */
+/* I/O-bound tasks (low util) boosted after a shorter sleep. */
+#define QS_IO_BOOST_SLEEP_NS 5000000ULL /* 5 ms */
 /* Minimum cpuperf delta before we actually call scx_bpf_cpuperf_set (hysteresis). */
 #define QS_CPUPERF_HYSTERESIS 52 /* ~5 % of 1024 */
 /* Batch vruntime lag window: tasks can't be more than this far behind the present. */
 #define QS_VTIME_LAG_NS 100000000ULL /* 100 ms */
+/* Interactive vtime sleep-credit per util percentage point (max 50 ms total). */
+#define QS_IVTIME_CREDIT_NS 500000ULL
+/* Slice util% above which a classified-interactive task earns burst credit. */
+#define QS_BURST_UTIL_THRESHOLD 90
+/* Max burst-slice dispatches a task can accumulate. */
+#define QS_BURST_CREDIT_MAX 3
+/* Burst slice = 2× interactive slice (10 ms). */
+#define QS_SLICE_BURST_NS (QS_SLICE_INTERACTIVE_NS * 2)
+/* Run durations shorter than this while still runnable hint at RT preemption. */
+#define QS_RT_PREEMPT_NS 300000ULL /* 300 µs */
 
 #define QS_LAT_BUCKETS 20
 
@@ -50,7 +62,8 @@ struct qs_task_ctx
     __u64 vruntime;        /* accumulated CPU time; used for vtime-ordered batch DSQ */
     __u32 wakeups;
     __u8 wakeup_boost; /* 1 = grant one interactive dispatch after long sleep */
-    __u8 pad[3];
+    __u8 burst_credit; /* remaining burst-slice dispatches (0–QS_BURST_CREDIT_MAX) */
+    __u8 pad[2];
 };
 
 struct qs_stats
@@ -64,6 +77,8 @@ struct qs_stats
     __u64 nr_mem_stall;      /* dispatches where slice_util_ewma < 40 (RAM-bound) */
     __u64 nr_rt_like;        /* dispatches for ultra-interactive (nice <= nice_rt_max) */
     __u64 nr_wakeup_boosted; /* batch tasks granted one interactive dispatch on wake */
+    __u64 nr_burst;          /* interactive tasks dispatched with 2× burst slice */
+    __u64 nr_rt_preempt;     /* suspected RT-preempted dispatches (short run, runnable) */
 };
 
 /* Written by userspace when PSI memory pressure exceeds a threshold.
