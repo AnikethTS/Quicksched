@@ -102,11 +102,13 @@ $(TARGET): src/scx_quicksched.c src/bpf/scx_quicksched.h $(SKEL_H)
 
 install: $(TARGET)
 	install -Dm755 $(TARGET)                          $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -Dm755 qs                                 $(DESTDIR)$(BINDIR)/qs
 	install -Dm644 man/scx_quicksched.1               $(DESTDIR)$(MANDIR)/scx_quicksched.1
 	install -Dm644 packaging/scx_quicksched.service   $(DESTDIR)$(UNITDIR)/scx_quicksched.service
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(BINDIR)/qs
 	rm -f $(DESTDIR)$(MANDIR)/scx_quicksched.1
 	rm -f $(DESTDIR)$(UNITDIR)/scx_quicksched.service
 

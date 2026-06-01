@@ -22,6 +22,34 @@ static uint64_t slo_us = 0;
 static uint32_t mem_pressure_pct = 0;
 static uint32_t io_pressure_pct = 0;
 static int32_t nice_rt_max_cfg = -10;
+static const char *pidfile_path = NULL;
+
+/* ── TUI settings panel ─────────────────────────────────────────────────── */
+static int settings_open = 0;
+static int settings_sel = 0; /* 0=mem 1=io 2=nice-rt-max 3=batch-cpuperf */
+
+/* Live values written into BPF dynamic_cfg each tick.  0 / unset = use rodata. */
+static uint32_t tui_batch_cpuperf_live = 0;
+static int32_t tui_nice_rt_max_live = -10;
+static int tui_nice_rt_max_set = 0;
+
+/* Preset tables (value -1 means "use CLI/rodata default") */
+static const int mem_presets[] = {0, 5, 10, 20, 30};
+static const char *mem_labels[] = {"Off", " 5%", "10%", "20%", "30%"};
+static const int io_presets[] = {0, 5, 10, 20, 30};
+static const char *io_labels[] = {"Off", " 5%", "10%", "20%", "30%"};
+/* nice: -22 = disabled (below min nice -20), -1 = use rodata default */
+static const int nice_presets[] = {-1, -5, -10, -15, -22};
+static const char *nice_labels[] = {"Default", "    -5 ", "   -10 ", "   -15 ", "Disabled"};
+/* batch cpuperf: -1 = use CLI default; others are pre-scaled 0-1024 */
+static const int batch_presets[] = {-1, 256, 512, 768, 1024};
+static const char *batch_labels[] = {"Default", "  25%  ", "  50%  ", "  75%  ", " 100%  "};
+#define N_PRESETS 5
+
+static int set_mem_idx = 0;
+static int set_io_idx = 0;
+static int set_nice_idx = 0;  /* Default */
+static int set_batch_idx = 0; /* Default */
 
 struct qs_psi
 {
@@ -198,6 +226,171 @@ static uint64_t lat_percentile(uint64_t *buckets, int pct)
 #define CP_LAT 5
 #define CP_DIM 6
 #define CP_WARN 7
+
+static void apply_settings(struct scx_quicksched_bpf *skel)
+{
+    mem_pressure_pct = (uint32_t)mem_presets[set_mem_idx];
+    io_pressure_pct = (uint32_t)io_presets[set_io_idx];
+
+    int nv = nice_presets[set_nice_idx];
+    if (nv == -1)
+    {
+        tui_nice_rt_max_set = 0;
+    }
+    else
+    {
+        tui_nice_rt_max_live = (int32_t)nv;
+        tui_nice_rt_max_set = 1;
+    }
+
+    int bv = batch_presets[set_batch_idx];
+    tui_batch_cpuperf_live = (bv == -1) ? 0 : (uint32_t)bv;
+
+    struct qs_dynamic_cfg dcfg = {
+        .batch_cpuperf_live = tui_batch_cpuperf_live,
+        .nice_rt_max_live = tui_nice_rt_max_live,
+        .nice_rt_max_set = (uint32_t)tui_nice_rt_max_set,
+    };
+    uint32_t key = 0;
+    bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg), BPF_ANY);
+}
+
+static int handle_key(int ch, struct scx_quicksched_bpf *skel)
+{
+    if (ch == 'q' || ch == 'Q')
+    {
+        stop = 1;
+        return 1;
+    }
+    if (ch == 'c' || ch == 'C')
+    {
+        settings_open = !settings_open;
+        return 1;
+    }
+    if (!settings_open)
+        return 0;
+    switch (ch)
+    {
+    case KEY_UP:
+        settings_sel = (settings_sel + 3) % 4;
+        return 1;
+    case KEY_DOWN:
+        settings_sel = (settings_sel + 1) % 4;
+        return 1;
+    case KEY_LEFT:
+        switch (settings_sel)
+        {
+        case 0:
+            set_mem_idx = (set_mem_idx + N_PRESETS - 1) % N_PRESETS;
+            break;
+        case 1:
+            set_io_idx = (set_io_idx + N_PRESETS - 1) % N_PRESETS;
+            break;
+        case 2:
+            set_nice_idx = (set_nice_idx + N_PRESETS - 1) % N_PRESETS;
+            break;
+        case 3:
+            set_batch_idx = (set_batch_idx + N_PRESETS - 1) % N_PRESETS;
+            break;
+        }
+        apply_settings(skel);
+        return 1;
+    case KEY_RIGHT:
+        switch (settings_sel)
+        {
+        case 0:
+            set_mem_idx = (set_mem_idx + 1) % N_PRESETS;
+            break;
+        case 1:
+            set_io_idx = (set_io_idx + 1) % N_PRESETS;
+            break;
+        case 2:
+            set_nice_idx = (set_nice_idx + 1) % N_PRESETS;
+            break;
+        case 3:
+            set_batch_idx = (set_batch_idx + 1) % N_PRESETS;
+            break;
+        }
+        apply_settings(skel);
+        return 1;
+    }
+    return 0;
+}
+
+static void draw_settings_panel(void)
+{
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+
+    const int pw = 40; /* panel width including borders */
+    const int ph = 8;  /* panel height including borders */
+    int px = (cols - pw) / 2;
+    int py = (rows - ph) / 2;
+    if (px < 0)
+        px = 0;
+    if (py < 0)
+        py = 0;
+
+    /* Clear panel area */
+    for (int y = py; y < py + ph && y < rows; y++)
+        for (int x = px; x < px + pw && x < cols; x++)
+            mvaddch(y, x, ' ');
+
+    /* Border */
+    for (int x = px + 1; x < px + pw - 1; x++)
+    {
+        mvaddch(py, x, ACS_HLINE);
+        mvaddch(py + ph - 1, x, ACS_HLINE);
+    }
+    for (int y = py + 1; y < py + ph - 1; y++)
+    {
+        mvaddch(y, px, ACS_VLINE);
+        mvaddch(y, px + pw - 1, ACS_VLINE);
+    }
+    mvaddch(py, px, ACS_ULCORNER);
+    mvaddch(py, px + pw - 1, ACS_URCORNER);
+    mvaddch(py + ph - 1, px, ACS_LLCORNER);
+    mvaddch(py + ph - 1, px + pw - 1, ACS_LRCORNER);
+
+    /* Title */
+    attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
+    mvprintw(py, px + (pw - 10) / 2, " CONFIG ");
+    attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
+
+    /* Setting rows */
+    struct
+    {
+        const char *label;
+        const char *val;
+    } srows[4] = {
+        {"mem-pressure-pct ", mem_labels[set_mem_idx]},
+        {"io-pressure-pct  ", io_labels[set_io_idx]},
+        {"nice-rt-max      ", nice_labels[set_nice_idx]},
+        {"batch-cpuperf-pct", batch_labels[set_batch_idx]},
+    };
+    for (int i = 0; i < 4; i++)
+    {
+        int y = py + 1 + i;
+        if (y >= rows)
+            break;
+        if (i == settings_sel)
+            attron(A_REVERSE | A_BOLD);
+        mvprintw(y, px + 1, " %-17s [ %-8s ]", srows[i].label, srows[i].val);
+        if (i == settings_sel)
+            attroff(A_REVERSE | A_BOLD);
+    }
+
+    /* Help line */
+    int hy = py + ph - 2;
+    if (hy < rows)
+    {
+        attron(COLOR_PAIR(CP_DIM));
+        mvprintw(hy, px + 1, "  %-36s", "UP/DN navigate  LT/RT change  C close");
+        attroff(COLOR_PAIR(CP_DIM));
+    }
+
+    refresh();
+}
 
 static void tui_init(void)
 {
@@ -504,6 +697,7 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
 
     attron(COLOR_PAIR(CP_DIM));
     mvprintw(rows - 1, 2, " developed by Aniketh T S ");
+    mvprintw(rows - 1, 29, " c:config ");
     {
         const char *contrib = " contribute: github.com/AnikethTS/Quicksched ";
         mvprintw(rows - 1, cols - (int)strlen(contrib) - 1, "%s", contrib);
@@ -535,6 +729,7 @@ int main(int argc, char **argv)
                                               {"mem-pressure-pct", required_argument, 0, 6},
                                               {"io-pressure-pct", required_argument, 0, 7},
                                               {"nice-rt-max", required_argument, 0, 8},
+                                              {"pidfile", required_argument, 0, 9},
                                               {"stats-interval", required_argument, 0, 's'},
                                               {"verbose", no_argument, 0, 'v'},
                                               {"version", no_argument, 0, 'V'},
@@ -581,6 +776,9 @@ int main(int argc, char **argv)
             break;
         case 8:
             nice_rt_max_cfg = (int32_t)strtol(optarg, NULL, 10);
+            break;
+        case 9:
+            pidfile_path = optarg;
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -656,6 +854,16 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    if (pidfile_path)
+    {
+        FILE *pf = fopen(pidfile_path, "w");
+        if (pf)
+        {
+            fprintf(pf, "%d\n", getpid());
+            fclose(pf);
+        }
+    }
+
     if (!no_tui)
     {
         tui_init();
@@ -697,6 +905,18 @@ int main(int argc, char **argv)
     time_t start_time = time(NULL);
     int psi_throttle_cooldown = 0;
 
+    /* Cache of last-drawn TUI data for instant redraw on keypress. */
+    struct
+    {
+        uint64_t d_int, d_batch, d_local, d_rt_like, d_stolen;
+        uint64_t d_preempted, d_memalloc, d_mem_stall;
+        uint64_t d_count, avg_us, p50, p99;
+        uint64_t d_buckets[QS_LAT_BUCKETS];
+        uint64_t uptime_s;
+        struct qs_psi psi, io_psi;
+        int psi_ok, io_psi_ok, psi_throttled;
+    } cache = {};
+
     if (!no_tui)
     {
         uint64_t zero[QS_LAT_BUCKETS] = {};
@@ -707,7 +927,28 @@ int main(int argc, char **argv)
 
     while (!stop)
     {
-        sleep(stats_interval ? stats_interval : 1);
+        /* Poll for keypresses every 100 ms; accumulate toward stats_interval. */
+        int total_ms = (stats_interval ? stats_interval : 1) * 1000;
+        for (int elapsed = 0; elapsed < total_ms && !stop; elapsed += 100)
+        {
+            usleep(100000);
+            if (!no_tui)
+            {
+                int ch = getch();
+                if (ch != ERR && handle_key(ch, skel))
+                {
+                    tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max,
+                             interactive_sleep_pct, no_cpuperf, cache.d_int, cache.d_batch,
+                             cache.d_local, cache.d_preempted, cache.d_memalloc, cache.d_mem_stall,
+                             cache.d_count, cache.avg_us, cache.p50, cache.p99, cache.d_buckets,
+                             cache.uptime_s, slo_us, cache.psi_ok ? &cache.psi : NULL,
+                             cache.psi_throttled, d_cpu, d_cpu_interactive, ncpus, cache.d_rt_like,
+                             cache.d_stolen, cache.io_psi_ok ? &cache.io_psi : NULL);
+                    if (settings_open)
+                        draw_settings_panel();
+                }
+            }
+        }
         if (stop)
             break;
 
@@ -766,6 +1007,22 @@ int main(int argc, char **argv)
                 }
             }
 
+            /* Always include live TUI settings so they survive PSI rewrites. */
+            dcfg.batch_cpuperf_live = tui_batch_cpuperf_live;
+            dcfg.nice_rt_max_live = tui_nice_rt_max_live;
+            dcfg.nice_rt_max_set = (uint32_t)tui_nice_rt_max_set;
+            bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg),
+                                 BPF_ANY);
+        }
+        else
+        {
+            /* No PSI throttling configured — still push live TUI settings. */
+            struct qs_dynamic_cfg dcfg = {
+                .batch_cpuperf_live = tui_batch_cpuperf_live,
+                .nice_rt_max_live = tui_nice_rt_max_live,
+                .nice_rt_max_set = (uint32_t)tui_nice_rt_max_set,
+            };
+            uint32_t key = 0;
             bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg),
                                  BPF_ANY);
         }
@@ -826,11 +1083,35 @@ int main(int argc, char **argv)
         if (!no_tui)
         {
             uint64_t uptime_s = (uint64_t)(time(NULL) - start_time);
+
+            /* Populate cache for key-triggered redraws between ticks. */
+            cache.d_int = d_int;
+            cache.d_batch = d_batch;
+            cache.d_local = d_local;
+            cache.d_rt_like = d_rt_like;
+            cache.d_stolen = d_stolen;
+            cache.d_preempted = d_preempted;
+            cache.d_memalloc = d_memalloc;
+            cache.d_mem_stall = d_mem_stall;
+            cache.d_count = d_count;
+            cache.avg_us = avg_us;
+            cache.p50 = p50;
+            cache.p99 = p99;
+            cache.uptime_s = uptime_s;
+            cache.psi_ok = psi_ok;
+            cache.psi = psi;
+            cache.io_psi_ok = io_psi_ok;
+            cache.io_psi = io_psi;
+            cache.psi_throttled = psi_throttled;
+            memcpy(cache.d_buckets, d_buckets, sizeof(d_buckets));
+
             tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max,
                      interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
                      d_memalloc, d_mem_stall, d_count, avg_us, p50, p99, d_buckets, uptime_s,
                      slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus,
                      d_rt_like, d_stolen, io_psi_ok ? &io_psi : NULL);
+            if (settings_open)
+                draw_settings_panel();
         }
         else
         {
@@ -894,6 +1175,9 @@ int main(int argc, char **argv)
             printf("scx_quicksched: stopped (%s)\n", exit_kind_str(xi.kind));
         }
     }
+
+    if (pidfile_path)
+        unlink(pidfile_path);
 
     scx_quicksched_bpf__destroy(skel);
     return 0;

@@ -223,12 +223,18 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
         if (tctx)
         {
             __s32 nice = (__s32)p->static_prio - 120;
-            bool rt_like = !(p->flags & PF_KTHREAD) && nice <= nice_rt_max;
+            __u32 zero = 0;
+            __s32 eff_rt_max = nice_rt_max;
+            {
+                struct qs_dynamic_cfg *dcfg = bpf_map_lookup_elem(&dynamic_cfg, &zero);
+                if (dcfg && dcfg->nice_rt_max_set)
+                    eff_rt_max = dcfg->nice_rt_max_live;
+            }
+            bool rt_like = !(p->flags & PF_KTHREAD) && nice <= eff_rt_max;
             bool interactive = rt_like || task_is_interactive(p, tctx);
             __u64 slice = rt_like       ? QS_SLICE_RT_LIKE_NS
                           : interactive ? slice_interactive_ns
                                         : slice_batch_ns;
-            __u32 zero = 0;
             struct qs_stats *st;
 
             tctx->assigned_slice_ns = slice;
@@ -280,10 +286,16 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 
     sel_cpu = p->scx.selected_cpu;
 
-    /* Ultra-interactive: nice <= nice_rt_max → global high-priority DSQ. */
+    /* Ultra-interactive: nice <= effective threshold → global high-priority DSQ. */
     {
         __s32 nice = (__s32)p->static_prio - 120;
-        if (!(p->flags & PF_KTHREAD) && nice <= nice_rt_max)
+        __s32 eff_rt_max = nice_rt_max;
+        {
+            struct qs_dynamic_cfg *dcfg_lv = bpf_map_lookup_elem(&dynamic_cfg, &zero);
+            if (dcfg_lv && dcfg_lv->nice_rt_max_set)
+                eff_rt_max = dcfg_lv->nice_rt_max_live;
+        }
+        if (!(p->flags & PF_KTHREAD) && nice <= eff_rt_max)
         {
             tctx->assigned_slice_ns = QS_SLICE_RT_LIKE_NS;
             scx_bpf_dsq_insert(p, QS_DSQ_RT_LIKE, QS_SLICE_RT_LIKE_NS, SCX_ENQ_HEAD);
@@ -434,7 +446,8 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
             struct qs_dynamic_cfg *dcfg = bpf_map_lookup_elem(&dynamic_cfg, &zero);
             __u32 base = (dcfg && dcfg->batch_cpuperf_abs_override)
                              ? dcfg->batch_cpuperf_abs_override
-                             : batch_cpuperf_abs;
+                         : (dcfg && dcfg->batch_cpuperf_live) ? dcfg->batch_cpuperf_live
+                                                              : batch_cpuperf_abs;
 
             /* Adaptive: scale batch CPU freq up as the batch queue grows. */
             struct qs_batch_depth *bd = bpf_map_lookup_elem(&batch_depth_map, &zero);
