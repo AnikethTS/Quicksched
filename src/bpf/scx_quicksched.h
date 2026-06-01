@@ -61,8 +61,10 @@ struct qs_stats
  * when the field is non-zero, allowing live pressure-based throttling. */
 struct qs_dynamic_cfg
 {
-    __u32 batch_cpuperf_abs_override; /* 0 = use rodata default */
-    __u32 pad;
+    __u32 batch_cpuperf_abs_override; /* PSI-driven throttle; 0 = off */
+    __u32 batch_cpuperf_live;         /* TUI-set base freq; 0 = use rodata */
+    __s32 nice_rt_max_live;           /* TUI-set threshold (when nice_rt_max_set=1) */
+    __u32 nice_rt_max_set;            /* 1 = nice_rt_max_live is valid */
 };
 
 struct qs_latency
