@@ -72,6 +72,7 @@ const volatile __s32 nice_interactive_max = 0;
 const volatile __u32 interactive_sleep_pct = 50;
 const volatile bool enable_cpuperf = true;
 const volatile __u32 batch_cpuperf_abs = 512; /* pre-scaled to 0-1024 by userspace */
+const volatile __s32 nice_rt_max = -10;
 
 extern int scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 extern void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym;
@@ -221,8 +222,11 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
         tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
         if (tctx)
         {
-            bool interactive = task_is_interactive(p, tctx);
-            __u64 slice = interactive ? slice_interactive_ns : slice_batch_ns;
+            __s32 nice = (__s32)p->static_prio - 120;
+            bool rt_like = !(p->flags & PF_KTHREAD) && nice <= nice_rt_max;
+            bool interactive = rt_like || task_is_interactive(p, tctx);
+            __u64 slice = rt_like ? QS_SLICE_RT_LIKE_NS :
+                          interactive ? slice_interactive_ns : slice_batch_ns;
             __u32 zero = 0;
             struct qs_stats *st;
 
@@ -230,8 +234,12 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 
             st = bpf_map_lookup_elem(&stats, &zero);
-            if (st)
-                st->nr_local++;
+            if (st) {
+                if (rt_like)
+                    st->nr_rt_like++;
+                else
+                    st->nr_local++;
+            }
         }
     }
 
@@ -268,8 +276,24 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    interactive = task_is_interactive(p, tctx);
     sel_cpu = p->scx.selected_cpu;
+
+    /* Ultra-interactive: nice <= nice_rt_max → global high-priority DSQ. */
+    {
+        __s32 nice = (__s32)p->static_prio - 120;
+        if (!(p->flags & PF_KTHREAD) && nice <= nice_rt_max)
+        {
+            tctx->assigned_slice_ns = QS_SLICE_RT_LIKE_NS;
+            scx_bpf_dsq_insert(p, QS_DSQ_RT_LIKE, QS_SLICE_RT_LIKE_NS, SCX_ENQ_HEAD);
+            st = bpf_map_lookup_elem(&stats, &zero);
+            if (st)
+                st->nr_rt_like++;
+            scx_bpf_kick_cpu(sel_cpu >= 0 ? sel_cpu : 0, SCX_KICK_PREEMPT);
+            return 0;
+        }
+    }
+
+    interactive = task_is_interactive(p, tctx);
 
     if (interactive)
     {
@@ -312,6 +336,13 @@ int BPF_PROG(scx_quicksched_dispatch, s32 cpu, struct task_struct *prev)
     __u32 zero = 0;
     struct qs_cpu_load *cl;
     __u32 is_interactive = 0;
+
+    /* Ultra-interactive DSQ: checked before per-CPU queues. */
+    if (scx_bpf_dsq_move_to_local(QS_DSQ_RT_LIKE))
+    {
+        is_interactive = 1;
+        goto dispatched;
+    }
 
     /* Own interactive DSQ */
     if (cpu >= 0 && (u32)cpu < nr_cpus && scx_bpf_dsq_move_to_local((u64)cpu))
@@ -533,6 +564,10 @@ s32 scx_quicksched_init(void)
         if (ret < 0)
             return ret;
     }
+
+    ret = scx_bpf_create_dsq(QS_DSQ_RT_LIKE, -1);
+    if (ret < 0)
+        return ret;
 
     return scx_bpf_create_dsq(QS_DSQ_BATCH, -1);
 }

@@ -20,6 +20,8 @@ static int no_tui;
 static int dry_run;
 static uint64_t slo_us = 0;
 static uint32_t mem_pressure_pct = 0;
+static uint32_t io_pressure_pct = 0;
+static int32_t nice_rt_max_cfg = -10;
 
 struct qs_psi
 {
@@ -30,6 +32,26 @@ struct qs_psi
 static bool read_psi_memory(struct qs_psi *out)
 {
     FILE *f = fopen("/proc/pressure/memory", "r");
+    char line[128];
+
+    if (!f)
+        return false;
+    out->some_avg10 = 0.0f;
+    out->full_avg10 = 0.0f;
+    while (fgets(line, sizeof(line), f))
+    {
+        if (strncmp(line, "some", 4) == 0)
+            sscanf(line, "some avg10=%f", &out->some_avg10);
+        else if (strncmp(line, "full", 4) == 0)
+            sscanf(line, "full avg10=%f", &out->full_avg10);
+    }
+    fclose(f);
+    return true;
+}
+
+static bool read_psi_io(struct qs_psi *out)
+{
+    FILE *f = fopen("/proc/pressure/io", "r");
     char line[128];
 
     if (!f)
@@ -94,8 +116,12 @@ static void usage(const char *prog)
            "      --no-tui                   plain text output\n"
            "      --dry-run                  load and verify BPF; exit without attaching\n"
            "      --slo-us N                 alert when p99 latency exceeds N us (0=off)\n"
-           "      --mem-pressure-pct N       tighten batch CPU freq when PSI some avg10 > N%% "
+           "      --mem-pressure-pct N       tighten batch CPU freq when PSI mem some avg10 > N%% "
            "(0=off)\n"
+           "      --io-pressure-pct N        tighten batch CPU freq when PSI io  some avg10 > N%% "
+           "(0=off)\n"
+           "      --nice-rt-max N            nice threshold for ultra-interactive DSQ "
+           "(default: -10)\n"
            "  -s, --stats-interval N         stats interval in seconds (default: 1)\n"
            "  -v, --verbose                  verbose libbpf output\n"
            "  -V, --version                  print version and exit\n"
@@ -222,7 +248,8 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
                      uint64_t d_mem_stall, uint64_t d_count, uint64_t avg_us, uint64_t p50,
                      uint64_t p99, uint64_t *d_buckets, uint64_t uptime_s, uint64_t slo_alert_us,
                      const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu,
-                     uint64_t *d_cpu_interactive, int ncpus)
+                     uint64_t *d_cpu_interactive, int ncpus,
+                     uint64_t d_rt_like, uint64_t d_stolen, const struct qs_psi *io_psi)
 {
     int rows, cols;
     char uts[32];
@@ -272,7 +299,7 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     mvprintw(row++, 2, "SCHEDULING");
     attroff(A_BOLD);
 
-    tot = d_int + d_batch + d_local;
+    tot = d_rt_like + d_int + d_batch + d_local;
     bar_w = cols - 34;
     if (bar_w < 8)
         bar_w = 8;
@@ -283,11 +310,13 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
         uint64_t val;
         int cp;
     } srows[] = {
+        {"  rt-like    ", d_rt_like, CP_WARN},
         {"  interactive", d_int, CP_IACTIVE},
         {"  batch      ", d_batch, CP_BATCH},
         {"  idle-fast  ", d_local, CP_IDLE},
+        {"  stolen     ", d_stolen, CP_DIM},
     };
-    for (i = 0; i < 3 && row < rows - 1; i++)
+    for (i = 0; i < 5 && row < rows - 1; i++)
     {
         uint64_t pct = tot > 0 ? srows[i].val * 100 / tot : 0;
         attron(COLOR_PAIR(srows[i].cp));
@@ -314,12 +343,21 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     {
         int psi_cp = psi->some_avg10 > 20.0f ? CP_WARN : psi->some_avg10 > 5.0f ? CP_BATCH : CP_DIM;
         attron(COLOR_PAIR(psi_cp));
-        mvprintw(row, 10, "  psi some=%.1f%% full=%.1f%%", psi->some_avg10, psi->full_avg10);
+        mvprintw(row, 10, "  mem some=%.1f%% full=%.1f%%", psi->some_avg10, psi->full_avg10);
         if (psi_throttled)
             mvprintw(row, 10 + 30, " [throttled]");
         attroff(COLOR_PAIR(psi_cp));
     }
     row++;
+
+    if (io_psi && row < rows - 1)
+    {
+        int io_cp = io_psi->some_avg10 > 20.0f ? CP_WARN : io_psi->some_avg10 > 5.0f ? CP_BATCH : CP_DIM;
+        attron(COLOR_PAIR(io_cp));
+        mvprintw(row, 10, "  io  some=%.1f%% full=%.1f%%", io_psi->some_avg10, io_psi->full_avg10);
+        attroff(COLOR_PAIR(io_cp));
+        row++;
+    }
 
     {
         struct
@@ -495,6 +533,8 @@ int main(int argc, char **argv)
                                               {"slo-us", required_argument, 0, 4},
                                               {"dry-run", no_argument, 0, 5},
                                               {"mem-pressure-pct", required_argument, 0, 6},
+                                              {"io-pressure-pct", required_argument, 0, 7},
+                                              {"nice-rt-max", required_argument, 0, 8},
                                               {"stats-interval", required_argument, 0, 's'},
                                               {"verbose", no_argument, 0, 'v'},
                                               {"version", no_argument, 0, 'V'},
@@ -535,6 +575,12 @@ int main(int argc, char **argv)
             break;
         case 6:
             mem_pressure_pct = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 7:
+            io_pressure_pct = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 8:
+            nice_rt_max_cfg = (int32_t)strtol(optarg, NULL, 10);
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -577,6 +623,7 @@ int main(int argc, char **argv)
     skel->rodata->interactive_sleep_pct = interactive_sleep_pct;
     skel->rodata->enable_cpuperf = !no_cpuperf;
     skel->rodata->batch_cpuperf_abs = batch_cpuperf_pct * 1024 / 100;
+    skel->rodata->nice_rt_max = nice_rt_max_cfg;
 
     int err = scx_quicksched_bpf__load(skel);
     if (err)
@@ -648,12 +695,14 @@ int main(int argc, char **argv)
     struct qs_stats prev_stats = {};
     struct qs_latency prev_lat = {};
     time_t start_time = time(NULL);
+    int psi_throttle_cooldown = 0;
 
     if (!no_tui)
     {
         uint64_t zero[QS_LAT_BUCKETS] = {};
         tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max, interactive_sleep_pct,
-                 no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, NULL, 0);
+                 no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, NULL, 0,
+                 0, 0, NULL);
     }
 
     while (!stop)
@@ -668,22 +717,52 @@ int main(int argc, char **argv)
         struct qs_stats cur_stats = {};
         struct qs_latency cur_lat = {};
         struct qs_psi psi = {};
+        struct qs_psi io_psi = {};
         int psi_ok = (int)read_psi_memory(&psi);
+        int io_psi_ok = (int)read_psi_io(&io_psi);
         int psi_throttled = 0;
 
-        if (psi_ok && mem_pressure_pct > 0)
+        if (mem_pressure_pct > 0 || io_pressure_pct > 0)
         {
             struct qs_dynamic_cfg dcfg = {};
             uint32_t key = 0;
-            if (psi.some_avg10 > (float)mem_pressure_pct)
+            uint32_t base = skel->rodata->batch_cpuperf_abs;
+
+            /* Compute normalised excess ratio for each pressure source. */
+            float ratio_mem = 0.0f, ratio_io = 0.0f;
+            if (psi_ok && mem_pressure_pct > 0 && psi.some_avg10 > (float)mem_pressure_pct)
+                ratio_mem = (psi.some_avg10 - (float)mem_pressure_pct) /
+                            (2.0f * (float)mem_pressure_pct);
+            if (io_psi_ok && io_pressure_pct > 0 && io_psi.some_avg10 > (float)io_pressure_pct)
+                ratio_io = (io_psi.some_avg10 - (float)io_pressure_pct) /
+                           (2.0f * (float)io_pressure_pct);
+
+            float ratio = ratio_mem > ratio_io ? ratio_mem : ratio_io;
+
+            if (ratio > 0.0f)
             {
-                /* Halve the configured batch CPU freq under memory pressure. */
-                uint32_t tight = skel->rodata->batch_cpuperf_abs / 2;
-                if (tight < 128)
-                    tight = 128;
-                dcfg.batch_cpuperf_abs_override = tight;
+                /* Graduated: 75% of base at threshold → 25% of base at 3× threshold. */
+                if (ratio > 1.0f) ratio = 1.0f;
+                float scale = 0.75f - 0.5f * ratio;
+                uint32_t override_val = (uint32_t)((float)base * scale);
+                if (override_val < 128) override_val = 128;
+                dcfg.batch_cpuperf_abs_override = override_val;
+                psi_throttle_cooldown = 3;
                 psi_throttled = 1;
             }
+            else if (psi_throttle_cooldown > 0)
+            {
+                /* Hysteresis: hold half-throttle for 3 more samples after pressure clears. */
+                psi_throttle_cooldown--;
+                if (psi_throttle_cooldown > 0)
+                {
+                    uint32_t tight = base / 2;
+                    if (tight < 128) tight = 128;
+                    dcfg.batch_cpuperf_abs_override = tight;
+                    psi_throttled = 1;
+                }
+            }
+
             bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg),
                                  BPF_ANY);
         }
@@ -721,6 +800,12 @@ int main(int argc, char **argv)
         uint64_t d_mem_stall = cur_stats.nr_mem_stall >= prev_stats.nr_mem_stall
                                    ? cur_stats.nr_mem_stall - prev_stats.nr_mem_stall
                                    : 0;
+        uint64_t d_rt_like = cur_stats.nr_rt_like >= prev_stats.nr_rt_like
+                                 ? cur_stats.nr_rt_like - prev_stats.nr_rt_like
+                                 : 0;
+        uint64_t d_stolen = cur_stats.nr_stolen >= prev_stats.nr_stolen
+                                ? cur_stats.nr_stolen - prev_stats.nr_stolen
+                                : 0;
 
         uint64_t d_count = cur_lat.count >= prev_lat.count ? cur_lat.count - prev_lat.count : 0;
         uint64_t d_total_ns =
@@ -741,22 +826,28 @@ int main(int argc, char **argv)
             tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max,
                      interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
                      d_memalloc, d_mem_stall, d_count, avg_us, p50, p99, d_buckets, uptime_s,
-                     slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus);
+                     slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus,
+                     d_rt_like, d_stolen, io_psi_ok ? &io_psi : NULL);
         }
         else
         {
-            uint64_t total = d_int + d_batch + d_local;
+            uint64_t total = d_rt_like + d_int + d_batch + d_local;
             if (total > 0)
-                printf("interactive=%6llu  batch=%6llu  idle-fast=%6llu  (%llu%% interactive)\n",
-                       (unsigned long long)d_int, (unsigned long long)d_batch,
-                       (unsigned long long)d_local, (unsigned long long)(d_int * 100 / total));
+                printf("rt-like=%6llu  interactive=%6llu  batch=%6llu  idle-fast=%6llu"
+                       "  stolen=%6llu\n",
+                       (unsigned long long)d_rt_like, (unsigned long long)d_int,
+                       (unsigned long long)d_batch, (unsigned long long)d_local,
+                       (unsigned long long)d_stolen);
             if (d_preempted > 0 || d_memalloc > 0 || d_mem_stall > 0)
                 printf("memory:  preempted=%llu  memalloc-demoted=%llu  mem-stall=%llu\n",
                        (unsigned long long)d_preempted, (unsigned long long)d_memalloc,
                        (unsigned long long)d_mem_stall);
             if (psi_ok)
-                printf("psi:  some=%.1f%%  full=%.1f%%%s\n", psi.some_avg10, psi.full_avg10,
+                printf("mem-psi:  some=%.1f%%  full=%.1f%%%s\n", psi.some_avg10, psi.full_avg10,
                        psi_throttled ? "  [batch throttled]" : "");
+            if (io_psi_ok)
+                printf("io-psi:   some=%.1f%%  full=%.1f%%\n", io_psi.some_avg10,
+                       io_psi.full_avg10);
             if (d_count > 0)
             {
                 printf("latency (wakeups):  avg=%lluus  p50=%lluus  p99=%lluus  n=%llu\n",

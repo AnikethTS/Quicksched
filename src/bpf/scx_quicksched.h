@@ -27,6 +27,10 @@
 /* Max CPUs to work-steal from; stride-spaced to cover the whole machine. */
 #define QS_MAX_STEAL_CPUS 16
 
+/* Global high-priority DSQ for ultra-interactive tasks (nice <= nice_rt_max). */
+#define QS_DSQ_RT_LIKE 0x20000ULL
+#define QS_SLICE_RT_LIKE_NS 2000000ULL  /* 2 ms */
+
 struct qs_task_ctx
 {
     __u64 sum_run_ns;
@@ -49,6 +53,7 @@ struct qs_stats
     __u64 nr_memalloc;  /* tasks demoted to batch due to PF_MEMALLOC */
     __u64 nr_stolen;    /* tasks work-stolen from another CPU's interactive DSQ */
     __u64 nr_mem_stall; /* dispatches where slice_util_ewma < 40 (RAM-bound) */
+    __u64 nr_rt_like;   /* dispatches for ultra-interactive (nice <= nice_rt_max) */
 };
 
 /* Written by userspace when PSI memory pressure exceeds a threshold.
