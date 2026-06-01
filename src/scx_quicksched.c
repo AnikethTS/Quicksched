@@ -23,6 +23,7 @@ static uint32_t mem_pressure_pct = 0;
 static uint32_t io_pressure_pct = 0;
 static int32_t nice_rt_max_cfg = -10;
 static const char *pidfile_path = NULL;
+static int json_mode = 0;
 
 /* ── TUI settings panel ─────────────────────────────────────────────────── */
 static int settings_open = 0;
@@ -442,7 +443,7 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
                      uint64_t p99, uint64_t *d_buckets, uint64_t uptime_s, uint64_t slo_alert_us,
                      const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu,
                      uint64_t *d_cpu_interactive, int ncpus, uint64_t d_rt_like, uint64_t d_stolen,
-                     const struct qs_psi *io_psi)
+                     uint64_t d_wakeup_boosted, const struct qs_psi *io_psi)
 {
     int rows, cols;
     char uts[32];
@@ -505,9 +506,9 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     } srows[] = {
         {"  rt-like    ", d_rt_like, CP_WARN}, {"  interactive", d_int, CP_IACTIVE},
         {"  batch      ", d_batch, CP_BATCH},  {"  idle-fast  ", d_local, CP_IDLE},
-        {"  stolen     ", d_stolen, CP_DIM},
+        {"  stolen     ", d_stolen, CP_DIM},   {"  woke-boost ", d_wakeup_boosted, CP_LAT},
     };
-    for (i = 0; i < 5 && row < rows - 1; i++)
+    for (i = 0; i < 6 && row < rows - 1; i++)
     {
         uint64_t pct = tot > 0 ? srows[i].val * 100 / tot : 0;
         attron(COLOR_PAIR(srows[i].cp));
@@ -707,6 +708,54 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
     refresh();
 }
 
+static void init_numa_map(struct scx_quicksched_bpf *skel)
+{
+    int ncpus = libbpf_num_possible_cpus();
+
+    /* Default: all CPUs on node 0. */
+    for (int cpu = 0; cpu < ncpus && cpu < QS_MAX_CPUS; cpu++)
+    {
+        uint32_t key = (uint32_t)cpu, val = 0;
+        bpf_map__update_elem(skel->maps.cpu_node, &key, sizeof(key), &val, sizeof(val), BPF_ANY);
+    }
+
+    /* Override with real topology from sysfs. */
+    for (int node = 0; node < 64; node++)
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            break;
+        char buf[4096] = {};
+        if (fgets(buf, sizeof(buf), f))
+        {
+            char *p = buf;
+            while (*p && *p != '\n')
+            {
+                int lo = (int)strtol(p, &p, 10);
+                int hi = lo;
+                if (*p == '-')
+                {
+                    p++;
+                    hi = (int)strtol(p, &p, 10);
+                }
+                for (int cpu = lo; cpu <= hi && cpu < QS_MAX_CPUS; cpu++)
+                {
+                    uint32_t key = (uint32_t)cpu, val = (uint32_t)node;
+                    bpf_map__update_elem(skel->maps.cpu_node, &key, sizeof(key), &val, sizeof(val),
+                                         BPF_ANY);
+                }
+                if (*p == ',')
+                    p++;
+                else
+                    break;
+            }
+        }
+        fclose(f);
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint64_t interactive_slice_us = 5000;
@@ -730,6 +779,7 @@ int main(int argc, char **argv)
                                               {"io-pressure-pct", required_argument, 0, 7},
                                               {"nice-rt-max", required_argument, 0, 8},
                                               {"pidfile", required_argument, 0, 9},
+                                              {"json", no_argument, 0, 10},
                                               {"stats-interval", required_argument, 0, 's'},
                                               {"verbose", no_argument, 0, 'v'},
                                               {"version", no_argument, 0, 'V'},
@@ -779,6 +829,10 @@ int main(int argc, char **argv)
             break;
         case 9:
             pidfile_path = optarg;
+            break;
+        case 10:
+            json_mode = 1;
+            no_tui = 1;
             break;
         case 's':
             stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
@@ -832,6 +886,8 @@ int main(int argc, char **argv)
         scx_quicksched_bpf__destroy(skel);
         return 1;
     }
+
+    init_numa_map(skel);
 
     if (dry_run)
     {
@@ -908,7 +964,7 @@ int main(int argc, char **argv)
     /* Cache of last-drawn TUI data for instant redraw on keypress. */
     struct
     {
-        uint64_t d_int, d_batch, d_local, d_rt_like, d_stolen;
+        uint64_t d_int, d_batch, d_local, d_rt_like, d_stolen, d_wakeup_boosted;
         uint64_t d_preempted, d_memalloc, d_mem_stall;
         uint64_t d_count, avg_us, p50, p99;
         uint64_t d_buckets[QS_LAT_BUCKETS];
@@ -922,7 +978,7 @@ int main(int argc, char **argv)
         uint64_t zero[QS_LAT_BUCKETS] = {};
         tui_draw(interactive_slice_us, batch_slice_us, nice_interactive_max, interactive_sleep_pct,
                  no_cpuperf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, zero, 0, slo_us, NULL, 0, NULL, NULL, 0,
-                 0, 0, NULL);
+                 0, 0, 0, NULL);
     }
 
     while (!stop)
@@ -943,7 +999,8 @@ int main(int argc, char **argv)
                              cache.d_count, cache.avg_us, cache.p50, cache.p99, cache.d_buckets,
                              cache.uptime_s, slo_us, cache.psi_ok ? &cache.psi : NULL,
                              cache.psi_throttled, d_cpu, d_cpu_interactive, ncpus, cache.d_rt_like,
-                             cache.d_stolen, cache.io_psi_ok ? &cache.io_psi : NULL);
+                             cache.d_stolen, cache.d_wakeup_boosted,
+                             cache.io_psi_ok ? &cache.io_psi : NULL);
                     if (settings_open)
                         draw_settings_panel();
                 }
@@ -1066,6 +1123,9 @@ int main(int argc, char **argv)
         uint64_t d_stolen = cur_stats.nr_stolen >= prev_stats.nr_stolen
                                 ? cur_stats.nr_stolen - prev_stats.nr_stolen
                                 : 0;
+        uint64_t d_wakeup_boosted = cur_stats.nr_wakeup_boosted >= prev_stats.nr_wakeup_boosted
+                                        ? cur_stats.nr_wakeup_boosted - prev_stats.nr_wakeup_boosted
+                                        : 0;
 
         uint64_t d_count = cur_lat.count >= prev_lat.count ? cur_lat.count - prev_lat.count : 0;
         uint64_t d_total_ns =
@@ -1090,6 +1150,7 @@ int main(int argc, char **argv)
             cache.d_local = d_local;
             cache.d_rt_like = d_rt_like;
             cache.d_stolen = d_stolen;
+            cache.d_wakeup_boosted = d_wakeup_boosted;
             cache.d_preempted = d_preempted;
             cache.d_memalloc = d_memalloc;
             cache.d_mem_stall = d_mem_stall;
@@ -1109,19 +1170,40 @@ int main(int argc, char **argv)
                      interactive_sleep_pct, no_cpuperf, d_int, d_batch, d_local, d_preempted,
                      d_memalloc, d_mem_stall, d_count, avg_us, p50, p99, d_buckets, uptime_s,
                      slo_us, psi_ok ? &psi : NULL, psi_throttled, d_cpu, d_cpu_interactive, ncpus,
-                     d_rt_like, d_stolen, io_psi_ok ? &io_psi : NULL);
+                     d_rt_like, d_stolen, d_wakeup_boosted, io_psi_ok ? &io_psi : NULL);
             if (settings_open)
                 draw_settings_panel();
+        }
+        else if (json_mode)
+        {
+            uint64_t uptime_s = (uint64_t)(time(NULL) - start_time);
+            printf("{\"ts\":%lu,\"interactive\":%llu,\"batch\":%llu,\"rt_like\":%llu,"
+                   "\"idle_fast\":%llu,\"stolen\":%llu,\"wakeup_boosted\":%llu,"
+                   "\"preempted\":%llu,\"memalloc\":%llu,\"mem_stall\":%llu,"
+                   "\"lat_avg_us\":%llu,\"lat_p50_us\":%llu,\"lat_p99_us\":%llu,"
+                   "\"lat_n\":%llu,\"psi_mem_some\":%.2f,\"psi_mem_full\":%.2f,"
+                   "\"psi_io_some\":%.2f,\"psi_io_full\":%.2f,"
+                   "\"throttled\":%d,\"uptime_s\":%lu}\n",
+                   (unsigned long)time(NULL), (unsigned long long)d_int,
+                   (unsigned long long)d_batch, (unsigned long long)d_rt_like,
+                   (unsigned long long)d_local, (unsigned long long)d_stolen,
+                   (unsigned long long)d_wakeup_boosted, (unsigned long long)d_preempted,
+                   (unsigned long long)d_memalloc, (unsigned long long)d_mem_stall,
+                   (unsigned long long)avg_us, (unsigned long long)p50, (unsigned long long)p99,
+                   (unsigned long long)d_count, psi_ok ? psi.some_avg10 : 0.0f,
+                   psi_ok ? psi.full_avg10 : 0.0f, io_psi_ok ? io_psi.some_avg10 : 0.0f,
+                   io_psi_ok ? io_psi.full_avg10 : 0.0f, psi_throttled, (unsigned long)uptime_s);
+            fflush(stdout);
         }
         else
         {
             uint64_t total = d_rt_like + d_int + d_batch + d_local;
             if (total > 0)
                 printf("rt-like=%6llu  interactive=%6llu  batch=%6llu  idle-fast=%6llu"
-                       "  stolen=%6llu\n",
+                       "  stolen=%6llu  woke-boost=%6llu\n",
                        (unsigned long long)d_rt_like, (unsigned long long)d_int,
                        (unsigned long long)d_batch, (unsigned long long)d_local,
-                       (unsigned long long)d_stolen);
+                       (unsigned long long)d_stolen, (unsigned long long)d_wakeup_boosted);
             if (d_preempted > 0 || d_memalloc > 0 || d_mem_stall > 0)
                 printf("memory:  preempted=%llu  memalloc-demoted=%llu  mem-stall=%llu\n",
                        (unsigned long long)d_preempted, (unsigned long long)d_memalloc,

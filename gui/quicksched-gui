@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+quicksched-gui — GTK4 front-end for scx_quicksched
+Requires ONLY: python3-gi gir1.2-gtk-4.0
+Install:  sudo apt install python3-gi gir1.2-gtk-4.0
+Run:      python3 gui/quicksched-gui
+"""
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gdk
+
+import json
+import queue
+import subprocess
+import sys
+import threading
+from collections import deque
+from pathlib import Path
+
+# ── paths & constants ─────────────────────────────────────────────────────────
+SELF = Path(__file__).resolve()
+BINARY = SELF.parent.parent / "scx_quicksched"
+HISTORY = 60  # sparkline samples
+
+PRESETS = {
+    "Gaming": dict(mem=10, io=5, nice=-5, batch=25),
+    "Desktop": dict(mem=0, io=0, nice=-10, batch=50),
+    "Server": dict(mem=20, io=15, nice=-15, batch=75),
+    "Battery": dict(mem=5, io=5, nice=-15, batch=25),
+}
+PSI_OPTS = [("Off", 0), ("5%", 5), ("10%", 10), ("20%", 20), ("30%", 30)]
+NICE_OPTS = [("Default", -1), ("-5", -5), ("-10", -10), ("-15", -15), ("Disabled", -22)]
+BATCH_OPTS = [("Default", -1), ("25%", 25), ("50%", 50), ("75%", 75), ("100%", 100)]
+
+# Unicode block chars for sparklines (index 0 = empty, 8 = full)
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def sparkline(history: deque, max_val: float = 0.0) -> str:
+    """Return a fixed-width sparkline string from a deque of floats."""
+    if not history:
+        return "─" * 20
+    mv = max_val or max(history) or 1.0
+    return "".join(_BLOCKS[min(8, int(v * 8 / mv))] for v in history)
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+_BASE_CSS = b"""
+window { background-color: #12141a; color: #dddde8; }
+.panel { background-color: #1a1d27; border-radius: 8px; padding: 10px; }
+.section-title { font-weight: bold; font-size: 11px; color: #8888aa; }
+.metric-val { font-family: monospace; font-size: 20px; font-weight: bold; }
+.metric-lbl { font-size: 11px; color: #888899; }
+.spark { font-family: monospace; font-size: 11px; color: #4488cc; }
+.running { color: #4ec942; font-weight: bold; }
+.stopped { color: #888888; }
+.dispatch-bar { border-radius: 4px; min-height: 30px; }
+.warn { color: #e04030; }
+.ok   { color: #4ec942; }
+headerbar { background-color: #0e1018; }
+"""
+
+
+# ── dispatch bar (CSS gradient, no Cairo) ─────────────────────────────────────
+class DispatchBar(Gtk.Box):
+    def __init__(self):
+        super().__init__()
+        self.add_css_class("dispatch-bar")
+        self._provider = Gtk.CssProvider()
+        self.get_style_context().add_provider(
+            self._provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        self._update(0, 0, 0, 0)
+
+    def update(self, rt_like, interactive, batch, idle_fast):
+        self._update(rt_like, interactive, batch, idle_fast)
+
+    def _update(self, rt_like, interactive, batch, idle_fast):
+        total = rt_like + interactive + batch + idle_fast or 1
+        p1 = rt_like * 100 / total
+        p2 = (rt_like + interactive) * 100 / total
+        p3 = (rt_like + interactive + batch) * 100 / total
+        # GTK CSS does not support "from% to%" range stops — use duplicate stops
+        # for hard color transitions instead.
+        css = (
+            f".dispatch-bar {{ background-image: linear-gradient(to right,"
+            f" #d03020 0%, #d03020 {p1:.1f}%,"
+            f" #38b054 {p1:.1f}%, #38b054 {p2:.1f}%,"
+            f" #c8a830 {p2:.1f}%, #c8a830 {p3:.1f}%,"
+            f" #3868c8 {p3:.1f}%, #3868c8 100%); }}"
+        )
+        self._provider.load_from_data(css.encode())
+
+
+# ── metric card ───────────────────────────────────────────────────────────────
+class MetricCard(Gtk.Box):
+    """Shows a large current value, a unit label, and a sparkline."""
+
+    def __init__(self, title, unit, color):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.add_css_class("panel")
+        self.set_hexpand(True)
+        self._history = deque(maxlen=HISTORY)
+
+        lbl = Gtk.Label(label=title, xalign=0)
+        lbl.add_css_class("section-title")
+        self.append(lbl)
+
+        row = Gtk.Box(spacing=6)
+        self._val_lbl = Gtk.Label(label="—", xalign=0)
+        self._val_lbl.add_css_class("metric-val")
+        self._val_lbl.set_markup(f'<span foreground="{color}">—</span>')
+        self._color = color
+
+        unit_lbl = Gtk.Label(label=unit, xalign=0)
+        unit_lbl.add_css_class("metric-lbl")
+        unit_lbl.set_valign(Gtk.Align.END)
+        unit_lbl.set_margin_bottom(4)
+        row.append(self._val_lbl)
+        row.append(unit_lbl)
+        self.append(row)
+
+        self._spark_lbl = Gtk.Label(label="", xalign=0)
+        self._spark_lbl.add_css_class("spark")
+        self.append(self._spark_lbl)
+
+    def push(self, value: float):
+        self._history.append(value)
+        self._val_lbl.set_markup(
+            f'<span foreground="{self._color}">{value:.0f}</span>'
+        )
+        self._spark_lbl.set_text(sparkline(self._history))
+
+
+# ── dual metric card (two series) ────────────────────────────────────────────
+class DualMetricCard(Gtk.Box):
+    def __init__(self, title, labels, colors, unit=""):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.add_css_class("panel")
+        self.set_hexpand(True)
+        self._histories = [deque(maxlen=HISTORY) for _ in labels]
+        self._colors = colors
+        self._labels_text = labels
+
+        hdr = Gtk.Label(label=title, xalign=0)
+        hdr.add_css_class("section-title")
+        self.append(hdr)
+
+        self._val_lbls = []
+        for i, (lbl_text, color) in enumerate(zip(labels, colors)):
+            row = Gtk.Box(spacing=6)
+            name = Gtk.Label(label=lbl_text + ":", xalign=0)
+            name.add_css_class("metric-lbl")
+            name.set_size_request(36, -1)
+            val = Gtk.Label(label="—", xalign=0)
+            val.add_css_class("metric-val")
+            val.set_markup(f'<span foreground="{color}">—</span>')
+            row.append(name)
+            row.append(val)
+            self.append(row)
+            self._val_lbls.append((val, color))
+
+        self._spark_lbls = []
+        for color in colors:
+            sl = Gtk.Label(label="", xalign=0)
+            sl.add_css_class("spark")
+            self.append(sl)
+            self._spark_lbls.append((sl, color))
+
+    def push(self, *values):
+        for i, v in enumerate(values):
+            self._histories[i].append(float(v))
+            val_lbl, color = self._val_lbls[i]
+            val_lbl.set_markup(f'<span foreground="{color}">{v:.0f}</span>')
+            sl, _c = self._spark_lbls[i]
+            sl.set_text(sparkline(self._histories[i]))
+
+
+# ── helper: Gtk.DropDown from (label, value) list ─────────────────────────────
+def _make_dropdown(opts, selected_val):
+    strings = Gtk.StringList.new([lbl for lbl, _ in opts])
+    dd = Gtk.DropDown(model=strings)
+    for i, (_, v) in enumerate(opts):
+        if v == selected_val:
+            dd.set_selected(i)
+            break
+    else:
+        dd.set_selected(0)
+    return dd
+
+
+# ── main window ───────────────────────────────────────────────────────────────
+class QuickschedWindow(Gtk.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app, title="Quicksched")
+        self.proc = None
+        self._queue = queue.SimpleQueue()
+        self.settings = dict(mem=0, io=0, nice=-10, batch=50)
+        self._dropdowns = {}
+        self._build_ui()
+        GLib.timeout_add(300, self._drain_queue)
+        GLib.timeout_add(1000, self._poll_proc)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.set_default_size(900, 640)
+
+        hb = Gtk.HeaderBar()
+        hb.set_show_title_buttons(True)
+        self.set_titlebar(hb)
+
+        self.status_lbl = Gtk.Label(label="● Stopped")
+        self.status_lbl.add_css_class("stopped")
+        hb.pack_start(self.status_lbl)
+
+        self.stop_btn = Gtk.Button(label="Stop")
+        self.stop_btn.connect("clicked", self._on_stop)
+        self.stop_btn.add_css_class("destructive-action")
+        self.stop_btn.set_sensitive(False)
+        hb.pack_end(self.stop_btn)
+
+        self.start_btn = Gtk.Button(label="Start")
+        self.start_btn.connect("clicked", self._on_start)
+        self.start_btn.add_css_class("suggested-action")
+        hb.pack_end(self.start_btn)
+
+        dev_lbl = Gtk.Label()
+        dev_lbl.set_markup('<span size="small" foreground="#666688">developed by Aniketh T S</span>')
+        hb.set_title_widget(dev_lbl)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.set_child(scroll)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.set_margin_start(12)
+        root.set_margin_end(12)
+        root.set_margin_top(12)
+        root.set_margin_bottom(12)
+        scroll.set_child(root)
+
+        # ── stats row ──
+        stats_row = Gtk.Box(spacing=10)
+        self.lat_card = DualMetricCard(
+            "Wakeup Latency", ["p50", "p99"], ["#50c878", "#e05030"], unit="µs"
+        )
+        self.psi_card = DualMetricCard(
+            "PSI Pressure (%)", ["mem", "io"], ["#5090e0", "#e0a030"]
+        )
+        stats_row.append(self.lat_card)
+        stats_row.append(self.psi_card)
+        root.append(stats_row)
+
+        # ── dispatch mix ──
+        mix_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        mix_box.add_css_class("panel")
+
+        mix_hdr = Gtk.Box(spacing=12)
+        mix_title = Gtk.Label(label="DISPATCH MIX", xalign=0)
+        mix_title.add_css_class("section-title")
+        mix_hdr.append(mix_title)
+
+        legend_items = [
+            ("rt-like", "#d03020"), ("interactive", "#38b054"),
+            ("batch", "#c8a830"), ("idle-fast", "#3868c8"),
+        ]
+        for name, color in legend_items:
+            dot = Gtk.Label()
+            dot.set_markup(f'<span foreground="{color}">■</span>')
+            lbl = Gtk.Label(label=name, xalign=0)
+            lbl.add_css_class("metric-lbl")
+            mix_hdr.append(dot)
+            mix_hdr.append(lbl)
+
+        mix_box.append(mix_hdr)
+        self.dispatch_bar = DispatchBar()
+        mix_box.append(self.dispatch_bar)
+
+        self._mix_lbl = Gtk.Label(label="", xalign=0)
+        self._mix_lbl.add_css_class("metric-lbl")
+        mix_box.append(self._mix_lbl)
+        root.append(mix_box)
+
+        # ── settings ──
+        settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        settings_box.add_css_class("panel")
+
+        stitle = Gtk.Label(label="SETTINGS", xalign=0)
+        stitle.add_css_class("section-title")
+        settings_box.append(stitle)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        specs = [
+            ("mem", "Mem pressure", PSI_OPTS, 0, 0),
+            ("io", "I/O pressure", PSI_OPTS, 0, 2),
+            ("nice", "nice-rt-max", NICE_OPTS, 1, 0),
+            ("batch", "Batch CPU freq", BATCH_OPTS, 1, 2),
+        ]
+        for key, lbl_text, opts, row, col in specs:
+            lbl = Gtk.Label(label=lbl_text + ":", xalign=1)
+            lbl.add_css_class("metric-lbl")
+            dd = _make_dropdown(opts, self.settings[key])
+            dd.connect("notify::selected", self._on_dropdown, key, opts)
+            self._dropdowns[key] = (dd, opts)
+            grid.attach(lbl, col, row, 1, 1)
+            grid.attach(dd, col + 1, row, 1, 1)
+        settings_box.append(grid)
+
+        preset_row = Gtk.Box(spacing=8)
+        preset_row.set_margin_top(4)
+        preset_row.append(Gtk.Label(label="Presets:"))
+        for name in PRESETS:
+            btn = Gtk.Button(label=name)
+            btn.connect("clicked", self._on_preset, name)
+            preset_row.append(btn)
+        settings_box.append(preset_row)
+        root.append(settings_box)
+
+        # apply CSS
+        css = Gtk.CssProvider()
+        css.load_from_data(_BASE_CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    # ── control ───────────────────────────────────────────────────────────────
+
+    def _flags(self):
+        s = self.settings
+        flags = ["--json"]
+        if s["mem"] > 0:
+            flags += ["--mem-pressure-pct", str(s["mem"])]
+        if s["io"] > 0:
+            flags += ["--io-pressure-pct", str(s["io"])]
+        if s["nice"] not in (-1, -22):
+            flags += ["--nice-rt-max", str(s["nice"])]
+        if s["batch"] not in (-1, 50):
+            flags += ["--batch-cpuperf-pct", str(s["batch"])]
+        return flags
+
+    def _on_start(self, _btn):
+        if not BINARY.exists():
+            self._set_running(False, f"binary not found: {BINARY}")
+            return
+        if self.proc and self.proc.poll() is None:
+            return
+        try:
+            self.proc = subprocess.Popen(
+                ["sudo", str(BINARY)] + self._flags(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as e:
+            self._set_running(False, str(e))
+            return
+        self._set_running(True)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _on_stop(self, _btn):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait()
+        self._set_running(False)
+
+    def _on_dropdown(self, dd, _pspec, key, opts):
+        idx = dd.get_selected()
+        if idx < len(opts):
+            self.settings[key] = opts[idx][1]
+
+    def _on_preset(self, _btn, name):
+        p = PRESETS[name]
+        self.settings.update(p)
+        for key, (dd, opts) in self._dropdowns.items():
+            for i, (_, val) in enumerate(opts):
+                if val == p[key]:
+                    dd.set_selected(i)
+                    break
+
+    def _set_running(self, running, extra=""):
+        if running:
+            self.status_lbl.set_label("● Running")
+            self.status_lbl.remove_css_class("stopped")
+            self.status_lbl.add_css_class("running")
+        else:
+            self.status_lbl.set_label("● Stopped" + (f"  ({extra})" if extra else ""))
+            self.status_lbl.remove_css_class("running")
+            self.status_lbl.add_css_class("stopped")
+        self.start_btn.set_sensitive(not running)
+        self.stop_btn.set_sensitive(running)
+
+    # ── stats ─────────────────────────────────────────────────────────────────
+
+    def _reader(self):
+        for line in self.proc.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    self._queue.put(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        GLib.idle_add(self._set_running, False)
+
+    def _drain_queue(self):
+        while not self._queue.empty():
+            s = self._queue.get_nowait()
+            self.lat_card.push(s.get("lat_p50_us", 0), s.get("lat_p99_us", 0))
+            self.psi_card.push(s.get("psi_mem_some", 0), s.get("psi_io_some", 0))
+            rt = s.get("rt_like", 0)
+            it = s.get("interactive", 0)
+            bt = s.get("batch", 0)
+            id_ = s.get("idle_fast", 0)
+            self.dispatch_bar.update(rt, it, bt, id_)
+            total = rt + it + bt + id_ or 1
+            self._mix_lbl.set_text(
+                f"rt-like {rt*100/total:.0f}%  "
+                f"interactive {it*100/total:.0f}%  "
+                f"batch {bt*100/total:.0f}%  "
+                f"idle-fast {id_*100/total:.0f}%"
+            )
+        return True
+
+    def _poll_proc(self):
+        if self.proc and self.proc.poll() is not None:
+            self._set_running(False)
+        return True
+
+
+# ── app ───────────────────────────────────────────────────────────────────────
+class QuickschedApp(Gtk.Application):
+    def do_activate(self):
+        QuickschedWindow(self).present()
+
+
+def main():
+    app = QuickschedApp(application_id="io.github.anikethts.quicksched")
+    sys.exit(app.run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()
