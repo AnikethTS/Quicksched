@@ -29,7 +29,7 @@
 
 /* Global high-priority DSQ for ultra-interactive tasks (nice <= nice_rt_max). */
 #define QS_DSQ_RT_LIKE 0x20000ULL
-#define QS_SLICE_RT_LIKE_NS 2000000ULL  /* 2 ms */
+#define QS_SLICE_RT_LIKE_NS 2000000ULL /* 2 ms */
 
 struct qs_task_ctx
 {

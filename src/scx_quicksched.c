@@ -248,8 +248,8 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
                      uint64_t d_mem_stall, uint64_t d_count, uint64_t avg_us, uint64_t p50,
                      uint64_t p99, uint64_t *d_buckets, uint64_t uptime_s, uint64_t slo_alert_us,
                      const struct qs_psi *psi, int psi_throttled, uint64_t *d_cpu,
-                     uint64_t *d_cpu_interactive, int ncpus,
-                     uint64_t d_rt_like, uint64_t d_stolen, const struct qs_psi *io_psi)
+                     uint64_t *d_cpu_interactive, int ncpus, uint64_t d_rt_like, uint64_t d_stolen,
+                     const struct qs_psi *io_psi)
 {
     int rows, cols;
     char uts[32];
@@ -310,10 +310,8 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
         uint64_t val;
         int cp;
     } srows[] = {
-        {"  rt-like    ", d_rt_like, CP_WARN},
-        {"  interactive", d_int, CP_IACTIVE},
-        {"  batch      ", d_batch, CP_BATCH},
-        {"  idle-fast  ", d_local, CP_IDLE},
+        {"  rt-like    ", d_rt_like, CP_WARN}, {"  interactive", d_int, CP_IACTIVE},
+        {"  batch      ", d_batch, CP_BATCH},  {"  idle-fast  ", d_local, CP_IDLE},
         {"  stolen     ", d_stolen, CP_DIM},
     };
     for (i = 0; i < 5 && row < rows - 1; i++)
@@ -352,7 +350,9 @@ static void tui_draw(uint64_t interactive_slice_us, uint64_t batch_slice_us, int
 
     if (io_psi && row < rows - 1)
     {
-        int io_cp = io_psi->some_avg10 > 20.0f ? CP_WARN : io_psi->some_avg10 > 5.0f ? CP_BATCH : CP_DIM;
+        int io_cp = io_psi->some_avg10 > 20.0f  ? CP_WARN
+                    : io_psi->some_avg10 > 5.0f ? CP_BATCH
+                                                : CP_DIM;
         attron(COLOR_PAIR(io_cp));
         mvprintw(row, 10, "  io  some=%.1f%% full=%.1f%%", io_psi->some_avg10, io_psi->full_avg10);
         attroff(COLOR_PAIR(io_cp));
@@ -731,21 +731,23 @@ int main(int argc, char **argv)
             /* Compute normalised excess ratio for each pressure source. */
             float ratio_mem = 0.0f, ratio_io = 0.0f;
             if (psi_ok && mem_pressure_pct > 0 && psi.some_avg10 > (float)mem_pressure_pct)
-                ratio_mem = (psi.some_avg10 - (float)mem_pressure_pct) /
-                            (2.0f * (float)mem_pressure_pct);
+                ratio_mem =
+                    (psi.some_avg10 - (float)mem_pressure_pct) / (2.0f * (float)mem_pressure_pct);
             if (io_psi_ok && io_pressure_pct > 0 && io_psi.some_avg10 > (float)io_pressure_pct)
-                ratio_io = (io_psi.some_avg10 - (float)io_pressure_pct) /
-                           (2.0f * (float)io_pressure_pct);
+                ratio_io =
+                    (io_psi.some_avg10 - (float)io_pressure_pct) / (2.0f * (float)io_pressure_pct);
 
             float ratio = ratio_mem > ratio_io ? ratio_mem : ratio_io;
 
             if (ratio > 0.0f)
             {
                 /* Graduated: 75% of base at threshold → 25% of base at 3× threshold. */
-                if (ratio > 1.0f) ratio = 1.0f;
+                if (ratio > 1.0f)
+                    ratio = 1.0f;
                 float scale = 0.75f - 0.5f * ratio;
                 uint32_t override_val = (uint32_t)((float)base * scale);
-                if (override_val < 128) override_val = 128;
+                if (override_val < 128)
+                    override_val = 128;
                 dcfg.batch_cpuperf_abs_override = override_val;
                 psi_throttle_cooldown = 3;
                 psi_throttled = 1;
@@ -757,7 +759,8 @@ int main(int argc, char **argv)
                 if (psi_throttle_cooldown > 0)
                 {
                     uint32_t tight = base / 2;
-                    if (tight < 128) tight = 128;
+                    if (tight < 128)
+                        tight = 128;
                     dcfg.batch_cpuperf_abs_override = tight;
                     psi_throttled = 1;
                 }

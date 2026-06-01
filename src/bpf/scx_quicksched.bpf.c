@@ -225,8 +225,9 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             __s32 nice = (__s32)p->static_prio - 120;
             bool rt_like = !(p->flags & PF_KTHREAD) && nice <= nice_rt_max;
             bool interactive = rt_like || task_is_interactive(p, tctx);
-            __u64 slice = rt_like ? QS_SLICE_RT_LIKE_NS :
-                          interactive ? slice_interactive_ns : slice_batch_ns;
+            __u64 slice = rt_like       ? QS_SLICE_RT_LIKE_NS
+                          : interactive ? slice_interactive_ns
+                                        : slice_batch_ns;
             __u32 zero = 0;
             struct qs_stats *st;
 
@@ -234,7 +235,8 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 
             st = bpf_map_lookup_elem(&stats, &zero);
-            if (st) {
+            if (st)
+            {
                 if (rt_like)
                     st->nr_rt_like++;
                 else
