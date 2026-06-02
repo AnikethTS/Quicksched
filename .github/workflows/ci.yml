@@ -52,6 +52,10 @@ jobs:
           test -f scx_quicksched
           file scx_quicksched
 
+      - name: Dry-run test (BPF load + verify, no attach)
+        if: steps.scx.outputs.available == 'true'
+        run: sudo ./scx_quicksched --dry-run
+
       - name: Fallback (no sched_ext kernel)
         if: steps.scx.outputs.available == 'false'
         run: echo "Skipping BPF build — sched_ext not available on this runner"
@@ -203,6 +207,17 @@ jobs:
       - name: Smoke-test (--help)
         if: env.SKIP != '1'
         run: ./scx_quicksched_asan --help
+
+      - name: Argument validation (invalid inputs must be rejected)
+        if: env.SKIP != '1'
+        run: |
+          ! ./scx_quicksched_asan --mem-pressure-pct abc 2>/dev/null
+          ! ./scx_quicksched_asan --io-pressure-pct xyz 2>/dev/null
+          ! ./scx_quicksched_asan --interactive-slice-us bad 2>/dev/null
+          ! ./scx_quicksched_asan --batch-slice-us bad 2>/dev/null
+          ! ./scx_quicksched_asan --nice-rt-max foo 2>/dev/null
+          ! ./scx_quicksched_asan --thermal-limit bar 2>/dev/null
+          ! ./scx_quicksched_asan --stats-interval notanumber 2>/dev/null
 
   format:
     name: clang-format check

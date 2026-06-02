@@ -102,7 +102,7 @@ static bool read_psi_io(struct qs_psi *out)
 /* Returns CPU package temperature in milli-Celsius, or -1 if unavailable. */
 static int read_cpu_temp_mc(void)
 {
-    for (int i = 0; i < 64; i++)
+    for (int i = 0; i < 256; i++)
     {
         char tpath[128], type[64];
         snprintf(tpath, sizeof(tpath), "/sys/class/thermal/thermal_zone%d/type", i);
@@ -830,6 +830,32 @@ static void init_llc_map(struct scx_quicksched_bpf *skel)
     }
 }
 
+static int parse_ull_arg(const char *name, const char *s, uint64_t *out)
+{
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (*end != '\0' || errno != 0) {
+        fprintf(stderr, "error: invalid value for %s: %s\n", name, s);
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_ll_arg(const char *name, const char *s, int64_t *out)
+{
+    char *end;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (*end != '\0' || errno != 0) {
+        fprintf(stderr, "error: invalid value for %s: %s\n", name, s);
+        return -1;
+    }
+    *out = (int64_t)v;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     uint64_t interactive_slice_us = 5000;
@@ -866,42 +892,78 @@ int main(int argc, char **argv)
     {
         switch (opt)
         {
-        case 'i':
-            interactive_slice_us = strtoull(optarg, NULL, 10);
+        case 'i': {
+            uint64_t v;
+            if (parse_ull_arg("--interactive-slice-us", optarg, &v))
+                return 1;
+            interactive_slice_us = v;
             break;
-        case 'b':
-            batch_slice_us = strtoull(optarg, NULL, 10);
+        }
+        case 'b': {
+            uint64_t v;
+            if (parse_ull_arg("--batch-slice-us", optarg, &v))
+                return 1;
+            batch_slice_us = v;
             break;
-        case 'n':
-            nice_interactive_max = (int32_t)strtol(optarg, NULL, 10);
+        }
+        case 'n': {
+            int64_t v;
+            if (parse_ll_arg("--nice-interactive-max", optarg, &v))
+                return 1;
+            nice_interactive_max = (int32_t)v;
             break;
-        case 'p':
-            interactive_sleep_pct = (uint32_t)strtoul(optarg, NULL, 10);
+        }
+        case 'p': {
+            uint64_t v;
+            if (parse_ull_arg("--interactive-sleep-pct", optarg, &v))
+                return 1;
+            interactive_sleep_pct = (uint32_t)v;
             break;
-        case 1:
-            batch_cpuperf_pct = (uint32_t)strtoul(optarg, NULL, 10);
+        }
+        case 1: {
+            uint64_t v;
+            if (parse_ull_arg("--batch-cpuperf-pct", optarg, &v))
+                return 1;
+            batch_cpuperf_pct = (uint32_t)v;
             break;
+        }
         case 2:
             no_cpuperf = 1;
             break;
         case 3:
             no_tui = 1;
             break;
-        case 4:
-            slo_us = strtoull(optarg, NULL, 10);
+        case 4: {
+            uint64_t v;
+            if (parse_ull_arg("--slo-us", optarg, &v))
+                return 1;
+            slo_us = v;
             break;
+        }
         case 5:
             dry_run = 1;
             break;
-        case 6:
-            mem_pressure_pct = (uint32_t)strtoul(optarg, NULL, 10);
+        case 6: {
+            uint64_t v;
+            if (parse_ull_arg("--mem-pressure-pct", optarg, &v))
+                return 1;
+            mem_pressure_pct = (uint32_t)v;
             break;
-        case 7:
-            io_pressure_pct = (uint32_t)strtoul(optarg, NULL, 10);
+        }
+        case 7: {
+            uint64_t v;
+            if (parse_ull_arg("--io-pressure-pct", optarg, &v))
+                return 1;
+            io_pressure_pct = (uint32_t)v;
             break;
-        case 8:
-            nice_rt_max_cfg = (int32_t)strtol(optarg, NULL, 10);
+        }
+        case 8: {
+            int64_t v;
+            if (parse_ll_arg("--nice-rt-max", optarg, &v))
+                return 1;
+            nice_rt_max_cfg = (int32_t)v;
             break;
+        }
         case 9:
             pidfile_path = optarg;
             break;
@@ -909,12 +971,20 @@ int main(int argc, char **argv)
             json_mode = 1;
             no_tui = 1;
             break;
-        case 11:
-            thermal_limit_c = (uint32_t)strtoul(optarg, NULL, 10);
+        case 11: {
+            uint64_t v;
+            if (parse_ull_arg("--thermal-limit", optarg, &v))
+                return 1;
+            thermal_limit_c = (uint32_t)v;
             break;
-        case 's':
-            stats_interval = (uint32_t)strtoul(optarg, NULL, 10);
+        }
+        case 's': {
+            uint64_t v;
+            if (parse_ull_arg("--stats-interval", optarg, &v))
+                return 1;
+            stats_interval = (uint32_t)v;
             break;
+        }
         case 'v':
             verbose = 1;
             break;
@@ -1193,7 +1263,6 @@ int main(int argc, char **argv)
                 if (tval < 128)
                     tval = 128;
                 dcfg.batch_cpuperf_abs_override = tval;
-                psi_throttled = 1;
                 psi_throttled = 1;
             }
             bpf_map__update_elem(skel->maps.dynamic_cfg, &key, sizeof(key), &dcfg, sizeof(dcfg),

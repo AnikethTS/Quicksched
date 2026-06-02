@@ -9,6 +9,8 @@ ConditionCapability=CAP_SYS_ADMIN
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/scx_quicksched --no-tui
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
 # Restart on crash; give the kernel a moment to revert to CFS between restarts.
 Restart=on-failure
 RestartSec=5s
