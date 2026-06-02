@@ -835,7 +835,8 @@ static int parse_ull_arg(const char *name, const char *s, uint64_t *out)
     char *end;
     errno = 0;
     unsigned long long v = strtoull(s, &end, 10);
-    if (*end != '\0' || errno != 0) {
+    if (*end != '\0' || errno != 0)
+    {
         fprintf(stderr, "error: invalid value for %s: %s\n", name, s);
         return -1;
     }
@@ -848,7 +849,8 @@ static int parse_ll_arg(const char *name, const char *s, int64_t *out)
     char *end;
     errno = 0;
     long long v = strtoll(s, &end, 10);
-    if (*end != '\0' || errno != 0) {
+    if (*end != '\0' || errno != 0)
+    {
         fprintf(stderr, "error: invalid value for %s: %s\n", name, s);
         return -1;
     }
@@ -892,35 +894,40 @@ int main(int argc, char **argv)
     {
         switch (opt)
         {
-        case 'i': {
+        case 'i':
+        {
             uint64_t v;
             if (parse_ull_arg("--interactive-slice-us", optarg, &v))
                 return 1;
             interactive_slice_us = v;
             break;
         }
-        case 'b': {
+        case 'b':
+        {
             uint64_t v;
             if (parse_ull_arg("--batch-slice-us", optarg, &v))
                 return 1;
             batch_slice_us = v;
             break;
         }
-        case 'n': {
+        case 'n':
+        {
             int64_t v;
             if (parse_ll_arg("--nice-interactive-max", optarg, &v))
                 return 1;
             nice_interactive_max = (int32_t)v;
             break;
         }
-        case 'p': {
+        case 'p':
+        {
             uint64_t v;
             if (parse_ull_arg("--interactive-sleep-pct", optarg, &v))
                 return 1;
             interactive_sleep_pct = (uint32_t)v;
             break;
         }
-        case 1: {
+        case 1:
+        {
             uint64_t v;
             if (parse_ull_arg("--batch-cpuperf-pct", optarg, &v))
                 return 1;
@@ -933,7 +940,8 @@ int main(int argc, char **argv)
         case 3:
             no_tui = 1;
             break;
-        case 4: {
+        case 4:
+        {
             uint64_t v;
             if (parse_ull_arg("--slo-us", optarg, &v))
                 return 1;
@@ -943,21 +951,24 @@ int main(int argc, char **argv)
         case 5:
             dry_run = 1;
             break;
-        case 6: {
+        case 6:
+        {
             uint64_t v;
             if (parse_ull_arg("--mem-pressure-pct", optarg, &v))
                 return 1;
             mem_pressure_pct = (uint32_t)v;
             break;
         }
-        case 7: {
+        case 7:
+        {
             uint64_t v;
             if (parse_ull_arg("--io-pressure-pct", optarg, &v))
                 return 1;
             io_pressure_pct = (uint32_t)v;
             break;
         }
-        case 8: {
+        case 8:
+        {
             int64_t v;
             if (parse_ll_arg("--nice-rt-max", optarg, &v))
                 return 1;
@@ -971,14 +982,16 @@ int main(int argc, char **argv)
             json_mode = 1;
             no_tui = 1;
             break;
-        case 11: {
+        case 11:
+        {
             uint64_t v;
             if (parse_ull_arg("--thermal-limit", optarg, &v))
                 return 1;
             thermal_limit_c = (uint32_t)v;
             break;
         }
-        case 's': {
+        case 's':
+        {
             uint64_t v;
             if (parse_ull_arg("--stats-interval", optarg, &v))
                 return 1;
