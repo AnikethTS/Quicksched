@@ -235,7 +235,7 @@ int BPF_PROG(scx_quicksched_runnable, struct task_struct *p, u64 enq_flags)
         tctx->enqueue_at = scx_bpf_now();
 
         if (sleep_dur >= QS_WAKEUP_BOOST_SLEEP_NS)
-            tctx->wakeup_boost = 1;
+            tctx->wakeup_boost = 2;
         /* I/O-bound tasks (low util) also get a boost after short sleeps. */
         else if (sleep_dur >= QS_IO_BOOST_SLEEP_NS && tctx->slice_util_ewma < 40)
             tctx->wakeup_boost = 1;
@@ -266,10 +266,13 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
                     eff_rt_max = dcfg->nice_rt_max_live;
             }
             bool rt_like = !(p->flags & PF_KTHREAD) && nice <= eff_rt_max;
-            bool boosted = tctx->wakeup_boost && !rt_like && !task_is_interactive(p, tctx);
-            tctx->wakeup_boost = 0;
+            bool boosted = tctx->wakeup_boost > 0 && !rt_like && !task_is_interactive(p, tctx);
+            if (tctx->wakeup_boost > 0)
+                tctx->wakeup_boost--;
             bool interactive = rt_like || boosted || task_is_interactive(p, tctx);
             __u64 slice;
+            struct qs_stats *st = bpf_map_lookup_elem(&stats, &zero);
+
             if (rt_like)
             {
                 slice = QS_SLICE_RT_LIKE_NS;
@@ -278,20 +281,17 @@ s32 BPF_PROG(scx_quicksched_select_cpu, struct task_struct *p, s32 prev_cpu, u64
             {
                 slice = QS_SLICE_BURST_NS;
                 tctx->burst_credit--;
-                struct qs_stats *st_b = bpf_map_lookup_elem(&stats, &zero);
-                if (st_b)
-                    st_b->nr_burst++;
+                if (st)
+                    st->nr_burst++;
             }
             else
             {
                 slice = interactive ? slice_interactive_ns : slice_batch_ns;
             }
-            struct qs_stats *st;
 
             tctx->assigned_slice_ns = slice;
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 
-            st = bpf_map_lookup_elem(&stats, &zero);
             if (st)
             {
                 if (rt_like)
@@ -341,6 +341,7 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     sel_cpu = p->scx.selected_cpu;
+    st = bpf_map_lookup_elem(&stats, &zero);
 
     /* Ultra-interactive: nice <= effective threshold → global high-priority DSQ. */
     {
@@ -355,7 +356,6 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         {
             tctx->assigned_slice_ns = QS_SLICE_RT_LIKE_NS;
             scx_bpf_dsq_insert(p, QS_DSQ_RT_LIKE, QS_SLICE_RT_LIKE_NS, SCX_ENQ_HEAD);
-            st = bpf_map_lookup_elem(&stats, &zero);
             if (st)
                 st->nr_rt_like++;
             scx_bpf_kick_cpu(sel_cpu >= 0 ? sel_cpu : 0, SCX_KICK_PREEMPT);
@@ -363,15 +363,12 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         }
     }
 
-    /* Wakeup boost: treat one enqueue after long sleep as interactive. */
-    bool boosted = tctx->wakeup_boost && !task_is_interactive(p, tctx);
-    tctx->wakeup_boost = 0;
-    if (boosted)
-    {
-        st = bpf_map_lookup_elem(&stats, &zero);
-        if (st)
-            st->nr_wakeup_boosted++;
-    }
+    /* Wakeup boost: treat one or more enqueues after long sleep as interactive. */
+    bool boosted = tctx->wakeup_boost > 0 && !task_is_interactive(p, tctx);
+    if (tctx->wakeup_boost > 0)
+        tctx->wakeup_boost--;
+    if (boosted && st)
+        st->nr_wakeup_boosted++;
 
     interactive = boosted || task_is_interactive(p, tctx);
 
@@ -387,7 +384,6 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
         {
             slice = QS_SLICE_BURST_NS;
             tctx->burst_credit--;
-            st = bpf_map_lookup_elem(&stats, &zero);
             if (st)
                 st->nr_burst++;
         }
@@ -411,7 +407,6 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
                 scx_bpf_kick_cpu((base_cpu + pi * stride) % nr_cpus, 0);
         }
 
-        st = bpf_map_lookup_elem(&stats, &zero);
         if (st)
             st->nr_interactive++;
         return 0;
@@ -431,7 +426,6 @@ int BPF_PROG(scx_quicksched_enqueue, struct task_struct *p, u64 enq_flags)
 
         scx_bpf_dsq_insert_vtime(p, QS_DSQ_BATCH, slice_batch_ns, tctx->vruntime, enq_flags);
 
-        st = bpf_map_lookup_elem(&stats, &zero);
         if (st)
             st->nr_batch++;
         return 0;
@@ -567,7 +561,6 @@ SEC("struct_ops/scx_quicksched_running")
 int BPF_PROG(scx_quicksched_running, struct task_struct *p)
 {
     struct qs_task_ctx *tctx;
-    s32 cpu;
 
     tctx = bpf_task_storage_get(&task_stor, p, 0, 0);
     if (!tctx)
@@ -575,10 +568,9 @@ int BPF_PROG(scx_quicksched_running, struct task_struct *p)
 
     tctx->run_at = scx_bpf_now();
 
-    cpu = bpf_get_smp_processor_id();
-
     if (enable_cpuperf)
     {
+        s32 cpu = bpf_get_smp_processor_id();
         bool mem_stall = tctx->wakeups >= QS_MIN_WAKEUPS && tctx->slice_util_ewma < 40;
         __u32 zero = 0;
         u32 perf;

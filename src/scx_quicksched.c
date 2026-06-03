@@ -1181,8 +1181,8 @@ int main(int argc, char **argv)
         struct qs_latency cur_lat = {};
         struct qs_psi psi = {};
         struct qs_psi io_psi = {};
-        int psi_ok = (int)read_psi_memory(&psi);
-        int io_psi_ok = (int)read_psi_io(&io_psi);
+        int psi_ok = mem_pressure_pct > 0 ? (int)read_psi_memory(&psi) : 0;
+        int io_psi_ok = io_pressure_pct > 0 ? (int)read_psi_io(&io_psi) : 0;
         int psi_throttled = 0;
         float cpu_temp_c = thermal_limit_c > 0 ? read_cpu_temp_mc() / 1000.0f : -1.0f;
 
@@ -1203,7 +1203,7 @@ int main(int argc, char **argv)
 
             float ratio = ratio_mem > ratio_io ? ratio_mem : ratio_io;
 
-            if (ratio > 0.0f)
+            if (ratio > 0.1f)
             {
                 /* Graduated: 75% of base at threshold → 25% of base at 3× threshold. */
                 if (ratio > 1.0f)
@@ -1243,8 +1243,6 @@ int main(int argc, char **argv)
                 if (dcfg.batch_cpuperf_abs_override == 0 || tval < dcfg.batch_cpuperf_abs_override)
                     dcfg.batch_cpuperf_abs_override = tval;
                 psi_throttled = 1;
-                if (!psi_throttled)
-                    psi_throttle_cooldown = 3;
             }
             if (dcfg.batch_cpuperf_abs_override > 0)
                 psi_throttled = 1;

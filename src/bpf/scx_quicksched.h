@@ -26,7 +26,7 @@
 /* Interactive vtime sleep-credit per util percentage point (max 50 ms total). */
 #define QS_IVTIME_CREDIT_NS 500000ULL
 /* Slice util% above which a classified-interactive task earns burst credit. */
-#define QS_BURST_UTIL_THRESHOLD 90
+#define QS_BURST_UTIL_THRESHOLD 75
 /* Max burst-slice dispatches a task can accumulate. */
 #define QS_BURST_CREDIT_MAX 3
 /* Burst slice = 2× interactive slice (10 ms). */
@@ -61,7 +61,7 @@ struct qs_task_ctx
     __u64 slice_util_ewma; /* EWMA of slice utilisation % (0-100); 100 = CPU-bound */
     __u64 vruntime;        /* accumulated CPU time; used for vtime-ordered batch DSQ */
     __u32 wakeups;
-    __u8 wakeup_boost; /* 1 = grant one interactive dispatch after long sleep */
+    __u8 wakeup_boost; /* credits: remaining interactive dispatches after long sleep */
     __u8 burst_credit; /* remaining burst-slice dispatches (0–QS_BURST_CREDIT_MAX) */
     __u8 pad[2];
 };
